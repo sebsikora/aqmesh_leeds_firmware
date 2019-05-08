@@ -1,9 +1,12 @@
 // Date and time functions using a PCF8523 RTC connected via I2C and Wire lib
 #include <Wire.h>
-#include <SD.h>
+//#include <SD.h>
+#include "SdFat.h"
 #include <RTClib.h>
 #include <Adafruit_ADS1015_NB.h>
-//#include <SPI.h>
+
+SdFat SD;
+#define SD_CS_PIN 10
 
 Adafruit_ADS1115 ADCS[4] = {Adafruit_ADS1115(0x48),
                             Adafruit_ADS1115(0x49),
@@ -56,7 +59,7 @@ const int NUM_SPOOL_COMMANDS = 3;
 const int MAX_SPOOL_COMMAND_LENGTH = 2;
 const char SPOOL_COMMAND_STRINGS[NUM_SPOOL_COMMANDS][MAX_SPOOL_COMMAND_LENGTH] = {"AK", "AR", "CC"};
 const byte SPOOL_COMMAND_LENGTHS[NUM_SPOOL_COMMANDS] = {2, 2, 2};
-const byte OUTPUT_PACKET_LENGTH = 128;
+const byte OUTPUT_PACKET_LENGTH = 96;
 char OUTPUT_BUFFER[OUTPUT_PACKET_LENGTH + 1];
 char FILENAME_BUFFER[13];
 char SEND_FILE_INDEX_BUFFER[4];
@@ -83,12 +86,15 @@ void setup() {
 
   // Initialise Real Time Clock.
   if (! RTC.begin()) {
+    //Serial.println(F("Couldn't initialise RTC..."));
     digitalWrite(PIN_RTC_FAIL_WARN, HIGH);
     while (1);
   }
   // INITIALISE SD CARD:
-  if (! SD.begin()) {
+  if (! SD.begin(SD_CS_PIN)) {
+    //Serial.println(F("Couldn't initialise SD card..."));
     digitalWrite(PIN_SD_FAIL_WARN, HIGH);
+    while (true) {}
   }
 
   // Initialise ADCs.
@@ -147,6 +153,14 @@ bool logTelemetry(const char * characters, uint8_t buffer_length) {
   return success;
 }
 
+void logTelemetry(const __FlashStringHelper* characters, const int len) {
+  char string_buffer[len + 1];
+  memcpy_P(string_buffer, characters, len);
+  string_buffer[len] = '\0';
+  logTelemetry(string_buffer, len);
+  return 0;
+}
+
 bool logFileToSend(const char * characters) {
   bool success = false;
   File SEND_FILE;
@@ -190,10 +204,10 @@ void loop() {
             COMMAND_MODE = 0;
           } else {
             if (mode == 1) {
-              serialSpeak("ak");
+              serialSpeak(F("ak"), 2);
               COMMAND_MODE = 1;
               TIME_COMMAND_MODE = 0;
-              logTelemetry("TUS", 3);
+              logTelemetry(F("TUS"), 3);
             }
             if (mode == 2) {
               now = RTC.now();
@@ -202,12 +216,12 @@ void loop() {
               log_index ++;                                                                                       // a new logging file (todays date, index incremented).
               COMMAND_MODE = 2;
               SPOOL_COMMAND_MODE = 0;
-              logTelemetry("TXS", 3);
+              logTelemetry(F("TXS"), 3);
             }
             COMMAND_START_TIMESTAMP = millis();
           }
         } else if (CRC_SUCCESS == false) {
-          serialSpeak("fl");
+          serialSpeak(F("fl"), 2);
           COMMAND_MODE = 0;
         }
         for (int j = 0; j < MAX_INPUT; j ++) {
@@ -286,6 +300,7 @@ void loop() {
       }
     }
   }
+  return 0;
 }
 
 bool logToSD(DateTime now, int log_index) {
@@ -299,10 +314,8 @@ bool logToSD(DateTime now, int log_index) {
   DATA_FILE = SD.open(filename, O_CREAT | O_WRITE | O_APPEND);
   if (DATA_FILE) {
     success = true;
-    //DATA_FILE.print(now.unixtime());
-    char time_string_buffer[11];
-    ultoa(now.unixtime(), time_string_buffer, 10);
-    DATA_FILE.write(time_string_buffer, 10);
+    ultoa(now.unixtime(), filename, 10);
+    DATA_FILE.write(filename, 10);
     for (uint8_t measurement_index = 0; measurement_index < 8; measurement_index ++) {
       DATA_FILE.write(',');
       dtostrf(ADC_TOTALS_0[measurement_index], 9, 2, filename);
@@ -319,8 +332,6 @@ bool logToSD(DateTime now, int log_index) {
 }
 
 bool serialListen(bool blocking) {
-  // Add incoming characters in hardware serial buffer to message buffer while available. Block until terminating \n
-  // character reached if blocking = true. If terminating character received zero message buffer index and return true.
   char character;
   bool message_to_process = false;
   while(true) {
@@ -398,6 +409,15 @@ void serialSpeak(const char * characters) {
   byte crc_check_value = CRC8(starting_addr, message_length);
   Serial.print(crc_check_value);
   Serial.print('\0');
+  return 0;
+}
+
+void serialSpeak(const __FlashStringHelper* characters, const int len) {
+  char string_buffer[len + 1];
+  memcpy_P(string_buffer, characters, len);
+  string_buffer[len] = '\0';
+  serialSpeak(string_buffer);
+  return 0;
 }
 
 int parseMessage(bool message_to_process, byte message_type) {
@@ -439,6 +459,7 @@ void applyCommand(int new_mode) {
       spoolFiles();
       break;
   }
+  return 0;
 }
 
 void setTime() {
@@ -453,16 +474,16 @@ void setTime() {
       mode = parseMessage(message_to_process, message_type);              // 0 = No change, 1 = Set time (ST), 2 = Spool data (TX).
       if (mode != 0) {                                                    // If RPI is still sending ST command, must not have received last ack from arduino...
         COMMAND_MODE = 0;                                               // Break out of ST command mode.
-        serialSpeak("m2");                                              // Send nack to arduino so ST command is re-sent.
+        serialSpeak(F("m2"), 2);                                              // Send nack to arduino so ST command is re-sent.
       } else if (mode == 0) {                                             // If RPI is not still sending ST command, must have received last ack from arduino...
         message_type = 1;                                               // Parsing message against time headers.
         mode = parseMessage(message_to_process, message_type);          // 0 = Not recognised, 1 = Year, 2 = Month, 3 = Day, 4 = Hour, 5 = Minute, 6 = Second.
         if (mode != 0) {                                                // If time header successfully parsed...
           COMMAND_STAGE = mode - 1;
           TIME_COMMAND_MODE = 1;                                      // Switch to receiving time values instead of time headers.
-          serialSpeak("ht");                                          // Send ack to RPI.
+          serialSpeak(F("ht"), 2);                                          // Send ack to RPI.
         } else if (mode == 0) {                                         // If time header not recognised...
-          serialSpeak("m3");                                          // Send nack to RPI so header is re-sent.
+          serialSpeak(F("m3"), 2);                                          // Send nack to RPI so header is re-sent.
         }
       }
     } else if (TIME_COMMAND_MODE == 1) {                                    // If we are waiting to receive a time value...
@@ -470,17 +491,17 @@ void setTime() {
       mode = parseMessage(message_to_process, message_type);              // 0 = Not recognised, 1 = Year, 2 = Month, 3 = Day, 4 = Hour, 5 = Minute, 6 = Second.
       if (mode != 0) {                                                    // If RPI is still sending time header, must not have received last ack from arduino...
         TIME_COMMAND_MODE = 0;                                          // Switch to receiving time headers instead of time values.
-        serialSpeak("m4");                                              // Send nack to RPI.
+        serialSpeak(F("m4"), 2);                                              // Send nack to RPI.
       } else if (mode == 0) {                                             // If RPI is sending values...
         TIMESTAMP_BUFFER[COMMAND_STAGE] = atoi(INPUT_MESSAGE_BUFFER);   // Convert value from char array to int.
         TIME_COMMAND_MODE = 0;                                          // Switch back to receiving time headers.
         if (COMMAND_STAGE == 5) {                                       // If this is the last time value to get...   (assumes headers are dispatched in order!)
           COMMAND_MODE = 0;                                           // Break out of ST command mode.
           RTC.adjust(DateTime(TIMESTAMP_BUFFER[0], TIMESTAMP_BUFFER[1], TIMESTAMP_BUFFER[2], TIMESTAMP_BUFFER[3], TIMESTAMP_BUFFER[4], TIMESTAMP_BUFFER[5]));   // Set the time.
-          serialSpeak("ts");                                          // Send final ack to RPI.
-          logTelemetry("TUC", 3);
+          serialSpeak(F("ts"), 2);                                          // Send final ack to RPI.
+          logTelemetry(F("TUC"), 3);
         } else if (COMMAND_STAGE < 5) {                                 // If this is not the last time value to get...
-          serialSpeak("ht");                                          // Send ack to RPI.
+          serialSpeak(F("ht"), 2);                                          // Send ack to RPI.
         }
       }
     }
@@ -489,13 +510,14 @@ void setTime() {
     }
     COMMAND_START_TIMESTAMP = millis();
   } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {  // Whatever it was arrived garbled, send an nak to the RPI.
-    serialSpeak("m5");                                                  // Send nack to RPI.
+    serialSpeak(F("m5"), 2);                                                  // Send nack to RPI.
     for (int j = 0; j < MAX_INPUT; j ++) {
       INPUT_MESSAGE_BUFFER[j] = '\0';
     }
     COMMAND_START_TIMESTAMP = millis();
   }
   checkCommandTimeout();
+  return 0;
 }
 
 bool spoolFiles() {
@@ -529,7 +551,7 @@ bool spoolFiles() {
         SPOOL_COMMAND_MODE = 1;                                             // Switch to 'Send file index' mode.
       } else {
         success = true;
-        serialSpeak("fs");                                                  // No more files in the SEND file list, signal to RPI we are finished.
+        serialSpeak(F("fs"), 2);                                                  // No more files in the SEND file list, signal to RPI we are finished.
         SEND_FILE_CURSOR = 0;                                               // Zero the SEND file cursor.
         SPOOL_COMMAND_MODE = 5;                                             // Switch to 'Completion handshake' mode.
       }
@@ -566,7 +588,7 @@ bool spoolFiles() {
       unsigned long data_file_size = DATA_FILE.size();
       if (DATA_FILE_CURSOR < (data_file_size - 1L)) {                                // If we haven't reached the end of the DATA file...
         DATA_FILE.seek(DATA_FILE_CURSOR);
-        uint8_t packet_size = 128;
+        uint8_t packet_size = OUTPUT_PACKET_LENGTH;
         if ((data_file_size - DATA_FILE_CURSOR) < packet_size) {
           packet_size = data_file_size - DATA_FILE_CURSOR;
         }
@@ -598,7 +620,7 @@ bool spoolFiles() {
         message_type = 2;                                                   // Otherwise, parse message against TX commands.
         byte new_mode = parseMessage(message_to_process, message_type);     // 0 = Not recognised, 1 = Acknowledge frame (AK), 2 = Acknowledge resend (AR), 3 = TX completed.
         if (new_mode == 0) {                                                // CRC check passed but command not recognised, confirm resend.
-          serialSpeak("cr");
+          serialSpeak(F("cr"), 2);
           SPOOL_COMMAND_MODE = 4;
         } else if (new_mode == 1) {                                         // AK received from RPI...
           if (EOF_FLAG == false) {
@@ -613,7 +635,7 @@ bool spoolFiles() {
       }
       COMMAND_START_TIMESTAMP = millis();
     } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {        // If message from RPI fails its CRC check, confirm resend.
-      serialSpeak("cr");
+      serialSpeak(F("cr"), 2);
       SPOOL_COMMAND_MODE = 4;
       COMMAND_START_TIMESTAMP = millis();
     }
@@ -624,16 +646,16 @@ bool spoolFiles() {
       byte message_type = 2;                                                  // Parse message against TX commands.
       int mode = parseMessage(message_to_process, message_type);              // 0 = Not recognised, 1 = Acknowledge frame (AK), 2 = Acknowledge resend (AR), 3 = TX completed.
       if (mode == 0) {                                                        // CRC check passed but command not recognised, confirm completion.
-        serialSpeak("fs");
+        serialSpeak(F("fs"), 2);
       } else if (mode == 3) {                                                 // CC received from RPI, transmission complete!
-        serialSpeak("cc");                                                  // Send final confirmation.
+        serialSpeak(F("cc"), 2);                                                  // Send final confirmation.
         SD.remove("SEND.TXT");
-        logTelemetry("TXC", 3);
+        logTelemetry(F("TXC"), 3);
         COMMAND_MODE = 0;                                                   // Switch back to base command mode.
       }
       COMMAND_START_TIMESTAMP = millis();
     } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {        // If message from RPI fails its CRC check, confirm completion.
-      serialSpeak("fs");
+      serialSpeak(F("fs"), 2);
       COMMAND_START_TIMESTAMP = millis();
     }
   }
@@ -646,8 +668,8 @@ bool checkCommandTimeout() {
   unsigned long current_timestamp = millis();
   if (current_timestamp > (COMMAND_START_TIMESTAMP + 500L)) {
     COMMAND_MODE = 0;
-    serialSpeak("to");
-    logTelemetry("CTO", 3);
+    serialSpeak(F("to"), 2);
+    logTelemetry(F("CTO"), 3);
     timeout = true;
   } else if (current_timestamp < COMMAND_START_TIMESTAMP) {
     // millis() must have overflowed. Correct for this.

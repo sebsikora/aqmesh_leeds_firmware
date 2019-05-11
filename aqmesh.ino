@@ -1,32 +1,28 @@
-// Date and time functions using a PCF8523 RTC connected via I2C and Wire lib
 #include <Wire.h>
-//#include <SD.h>
 #include "SdFat.h"
 #include <RTClib.h>
 #include <Adafruit_ADS1015_NB.h>
+#include <SPI.h>
 
 SdFat SD;
 #define SD_CS_PIN 10
+
+RTC_PCF8523 RTC;
 
 Adafruit_ADS1115 ADCS[4] = {Adafruit_ADS1115(0x48),
                             Adafruit_ADS1115(0x49),
                             Adafruit_ADS1115(0x4A),
                             Adafruit_ADS1115(0x4B)};
 
-RTC_PCF8523 RTC;
-
-int RESET_WARNING = 0;
-unsigned long UC_TIMESTAMP;
-int REPEAT_COUNT = 0;
-int32_t UPDATE_RATE_SECS = 2;
-unsigned long UPDATE_TIMESTAMP = 0;
+// OPC Measurement.
+uint8_t OPC_UPDATE_RATE_SECS = 5;
+int _CS = 4;
+char SPI_in[86];
 
 // ADC Measurement.
-float ADC_TOTALS_0[8]={0.0, 0.0, 0.0, 0.0,
-                      0.0, 0.0, 0.0, 0.0};
-float ADC_TOTALS_1[8]={0.0, 0.0, 0.0, 0.0,
-                      0.0, 0.0, 0.0, 0.0};
-
+int32_t ADC_TOTALS_0[8]={0, 0, 0, 0, 0, 0, 0, 0};
+int32_t ADC_TOTALS_1[8]={0, 0, 0, 0, 0, 0, 0, 0};
+uint8_t ADC_UPDATE_RATE_SECS = 2;
 uint8_t ADCS_PER_CHANNEL[4] = {4, 2, 1, 1};
 unsigned long ADC_TIMESTAMP = 0;
 unsigned long ADC_INTEGRATION_TIME_MSECS = 63;
@@ -40,7 +36,7 @@ const byte COMMAND_LENGTHS[NUM_COMMANDS] = {2, 2};
 const int MAX_INPUT = 9;
 byte INPUT_MODE = 0;    // 0 = message, 1 = CRC8 check.
 char INPUT_MESSAGE_BUFFER[MAX_INPUT];
-char INPUT_CRC_BUFFER[4] = "   ";
+char INPUT_CRC_BUFFER[4];
 byte INPUT_MESSAGE_LENGTH = 0;
 byte INPUT_CRC_LENGTH = 0;
 int RECEIVE_INDEX = 0;
@@ -59,7 +55,7 @@ const int NUM_SPOOL_COMMANDS = 3;
 const int MAX_SPOOL_COMMAND_LENGTH = 2;
 const char SPOOL_COMMAND_STRINGS[NUM_SPOOL_COMMANDS][MAX_SPOOL_COMMAND_LENGTH] = {"AK", "AR", "CC"};
 const byte SPOOL_COMMAND_LENGTHS[NUM_SPOOL_COMMANDS] = {2, 2, 2};
-const byte OUTPUT_PACKET_LENGTH = 96;
+const byte OUTPUT_PACKET_LENGTH = 128;
 char OUTPUT_BUFFER[OUTPUT_PACKET_LENGTH + 1];
 char FILENAME_BUFFER[13];
 char SEND_FILE_INDEX_BUFFER[4];
@@ -75,15 +71,17 @@ const int PIN_SD_FAIL_WARN = 7;
 
 void setup() {
   // Setup pins.
+  digitalWrite(_CS, HIGH);
+  pinMode(_CS, OUTPUT);
   pinMode(PIN_RPI_CONNECTED, INPUT_PULLUP);
   pinMode(PIN_RTC_FAIL_WARN, OUTPUT);
   digitalWrite(PIN_RTC_FAIL_WARN, LOW);
   pinMode(PIN_SD_FAIL_WARN, OUTPUT);
   digitalWrite(PIN_SD_FAIL_WARN, LOW);
-
+  
   Serial.begin(115200);
   delay(500);
-
+  
   // Initialise Real Time Clock.
   if (! RTC.begin()) {
     //Serial.println(F("Couldn't initialise RTC..."));
@@ -96,24 +94,35 @@ void setup() {
     digitalWrite(PIN_SD_FAIL_WARN, HIGH);
     while (true) {}
   }
-
+  
   // Initialise ADCs.
   initialiseChannel(0);
   initialiseChannel(1);
   initialiseChannel(2);
   initialiseChannel(3);
 
+  // Set I2C clock frequency above the default.
   Wire.setClock(800000L);
+
+  // Start-up the OPC.
+  bool fan_state = OPCN3_setOPCState(0, true);
+  delay(5000);
+  bool laser_state = OPCN3_setOPCState(1, true);
+  delay(1000);
+  if (! (fan_state && laser_state)) {
+    Serial.println(F("Could not start OPC."));
+    while (true) {}
+  }
 }
 
 int getLogIndex() {
-  char filename[13] = "            ";
   // Determine next file number.
   int log_index = 0;
   DateTime filenow;
   // Get the current time from the RTC.
   filenow = RTC.now();
   bool finished = false;
+  char filename[13];
   while (true) {
     // Generate current logging filename.
     sprintf(filename, "%04d%02d%02d.%03d", filenow.year(), filenow.month(), filenow.day(), log_index);
@@ -127,7 +136,7 @@ int getLogIndex() {
   }
   if (log_index > 0) {
     log_index = log_index - 1;
-    logTelemetry("AR", 2);
+    logTelemetry(F("AR"), 2);
   }
   return log_index;
 }
@@ -138,16 +147,16 @@ bool logTelemetry(const char * characters, uint8_t buffer_length) {
   File LOG_FILE;
   // Get the current time from the RTC.
   lognow = RTC.now();
-  LOG_FILE = SD.open("LOG.CSV", O_CREAT | O_WRITE | O_APPEND);
+  char string_buffer[11];
+  memcpy_P(string_buffer, F("LOG.CSV"), 8);
+  LOG_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
   if (LOG_FILE) {
     success = true;
-    char time_string_buffer[11];
-    ultoa(lognow.unixtime(), time_string_buffer, 10);
-    LOG_FILE.write(time_string_buffer, 10);
+    ultoa(lognow.unixtime(), string_buffer, 10);
+    LOG_FILE.write(string_buffer, 10);
     LOG_FILE.write(',');
     LOG_FILE.write(characters, buffer_length);
-    LOG_FILE.write('\r');
-    LOG_FILE.write('\n');
+    LOG_FILE.write("\r\n", 2);
     LOG_FILE.close();
   }
   return success;
@@ -164,13 +173,15 @@ void logTelemetry(const __FlashStringHelper* characters, const int len) {
 bool logFileToSend(const char * characters) {
   bool success = false;
   File SEND_FILE;
-  SEND_FILE = SD.open("SEND.TXT", O_CREAT | O_WRITE | O_APPEND);
+  char string_buffer[9];
+  memcpy_P(string_buffer, F("SEND.TXT"), 9);
+  SEND_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
   if (SEND_FILE) {
     success = true;
     for (int n = 0; *characters != '\0'; characters ++) {
       SEND_FILE.print(*characters);
     }
-    SEND_FILE.print("\r\n");
+    SEND_FILE.write("\r\n", 2);
     SEND_FILE.close();
   }
   return success;
@@ -179,9 +190,11 @@ bool logFileToSend(const char * characters) {
 void loop() {
   DateTime now = RTC.now();
   DateTime last_time = now;
-  UC_TIMESTAMP = millis();
+  uint32_t adc_last_time = now.unixtime();
+  uint32_t opc_last_time = now.unixtime();
+  uint8_t file_change_last_day = now.day();
   int log_index = getLogIndex();
-  char filename[13] = "            ";
+  char filename[13];
   uint8_t adc_mode = 0;
   while (true) {
     // Listen for any new incoming characters over serial connection, set new mode appropriately.
@@ -197,7 +210,7 @@ void loop() {
           message_type = 0;
           mode = parseMessage(message_to_process, message_type);          // 0 = No change, 1 = Set time...
           if (mode == 0) {
-            serialSpeak("fl");
+            serialSpeak(F("fl"), 2);
             COMMAND_MODE = 0;
           } else {
             if (mode == 1) {
@@ -222,7 +235,7 @@ void loop() {
           COMMAND_MODE = 0;
         }
         for (int j = 0; j < MAX_INPUT; j ++) {
-          INPUT_MESSAGE_BUFFER[j] = '0';
+          INPUT_MESSAGE_BUFFER[j] = '\0';
         }
       }
     } else {
@@ -232,17 +245,24 @@ void loop() {
     adc_mode = readADCS(adc_mode);
     
     now = RTC.now();
-    if (now.unixtime() >= (last_time.unixtime() + UPDATE_RATE_SECS)) {
-      last_time = now;
-      if (now.day() != last_time.day()) {        // If the day has changed since we last wrote measurements to the SD card, we've rolled-over Midnight, or changed the date,
-                                                 // so we start a new extension index and add the last filename to the 'to send' file.
+    if ((now.unixtime() >= (adc_last_time + (uint32_t)ADC_UPDATE_RATE_SECS)) || (now.unixtime() >= (opc_last_time + (uint32_t)OPC_UPDATE_RATE_SECS))) {
+      if (now.day() != file_change_last_day) {        // If the day has changed since we last wrote measurements to the SD card, we've rolled-over Midnight, or changed the date,
+                                                      // so we start a new extension index and add the last filename to the 'to send' file.
        sprintf(filename, "%04d%02d%02d.%03d", last_time.year(), last_time.month(), last_time.day(), log_index);
        logFileToSend(filename);
        log_index = 0;
+       file_change_last_day = now.day();
       }
-      averageADCAccumulators();
-      logToSD(now, log_index);
-      clearADCAccumulators();
+      if (now.unixtime() >= (adc_last_time + (uint32_t)ADC_UPDATE_RATE_SECS)) {
+        logADCSToSD(now, log_index);
+        clearADCAccumulators();
+        adc_last_time = now.unixtime();
+      }
+      if (now.unixtime() >= (opc_last_time + (uint32_t)OPC_UPDATE_RATE_SECS)) {
+        bool success = OPCN3_readHistogram();
+        success = logOPCToSD(now, log_index);
+        opc_last_time = now.unixtime();
+      }
     }
   }
   return 0;
@@ -276,7 +296,6 @@ uint8_t readADCS(uint8_t adc_mode) {
     temp_timestamp = millis();
     if (temp_timestamp >= (ADC_TIMESTAMP + ADC_INTEGRATION_TIME_MSECS)) {
       accumulateADCReadings(1);
-      //Serial.println(millis() - test_timestamp);
       ITERATION_INDEX[1] += 1;
       adc_mode = 0;
     } else if (temp_timestamp < ADC_TIMESTAMP) {
@@ -291,26 +310,28 @@ uint8_t readADCS(uint8_t adc_mode) {
   return adc_mode;
 }
 
-bool logToSD(DateTime now, int log_index) {
+bool logADCSToSD(DateTime now, int log_index) {
   bool success = false;
-  char filename[13] = "            ";
+  char filename[13];
   File DATA_FILE;
-  // Get the current time from the RTC.
-  now = RTC.now();
   // Generate current logging filename.
   sprintf(filename, "%04d%02d%02d.%03d", now.year(), now.month(), now.day(), log_index);
   DATA_FILE = SD.open(filename, O_CREAT | O_WRITE | O_APPEND);
   if (DATA_FILE) {
     success = true;
+    memcpy_P(filename, F("<ADCS>"), 7);
+    DATA_FILE.write(filename, 6);
     ultoa(now.unixtime(), filename, 10);
     DATA_FILE.write(filename, 10);
     for (uint8_t measurement_index = 0; measurement_index < 8; measurement_index ++) {
       DATA_FILE.write(',');
-      dtostrf(ADC_TOTALS_0[measurement_index], 0, 3, filename);
+      float value = (float)ADC_TOTALS_0[measurement_index] / (float)ITERATION_INDEX[0];
+      dtostrf(value, 0, 3, filename);
       uint8_t val_length = strlen(filename);
       DATA_FILE.write(filename, val_length);
       DATA_FILE.write(',');
-      dtostrf(ADC_TOTALS_1[measurement_index], 0, 3, filename);
+      value = (float)ADC_TOTALS_1[measurement_index] / (float)ITERATION_INDEX[1];
+      dtostrf(value, 0, 3, filename);
       val_length = strlen(filename);
       DATA_FILE.write(filename, val_length);
     }
@@ -514,7 +535,9 @@ bool spoolFiles() {
   if (SPOOL_COMMAND_MODE == 0) {
     // Open SEND file and read the next 13 characters from it into a filename buffer.
     File SEND_FILE;
-    SEND_FILE = SD.open("SEND.TXT");
+    char string_buffer[9];
+    memcpy_P(string_buffer, F("SEND.TXT"), 9);
+    SEND_FILE = SD.open(string_buffer);
     if (SEND_FILE) {
       unsigned long send_file_size = SEND_FILE.size();
       if (SEND_FILE_CURSOR < send_file_size) {                               // If we haven't reached the end of the send file list...
@@ -638,7 +661,9 @@ bool spoolFiles() {
         serialSpeak(F("fs"), 2);
       } else if (mode == 3) {                                                 // CC received from RPI, transmission complete!
         serialSpeak(F("cc"), 2);                                                  // Send final confirmation.
-        SD.remove("SEND.TXT");
+        char string_buffer[9];
+        memcpy_P(string_buffer, F("SEND.TXT"), 9);
+        SD.remove(string_buffer);
         logTelemetry(F("TXC"), 3);
         COMMAND_MODE = 0;                                                   // Switch back to base command mode.
       }
@@ -725,9 +750,9 @@ void accumulateADCReadings(uint8_t bank) {
     for (uint8_t j = 0; j < ADCS_PER_CHANNEL[i]; j ++) {
       int16_t new_measurement = ADCS[j].NB_Read_ADC_Differential();
       if (bank == 0) {
-        ADC_TOTALS_0[adcs_to_this_point] += (float)new_measurement;
+        ADC_TOTALS_0[adcs_to_this_point] += (int32_t)new_measurement;
       } else {
-        ADC_TOTALS_1[adcs_to_this_point] += (float)new_measurement;
+        ADC_TOTALS_1[adcs_to_this_point] += (int32_t)new_measurement;
       }
       adcs_to_this_point += 1;
     }
@@ -735,21 +760,281 @@ void accumulateADCReadings(uint8_t bank) {
   return 0;
 }
 
-void averageADCAccumulators() {
-  for (uint8_t i = 0; i < 8; i ++) {
-    ADC_TOTALS_0[i] /= (float)ITERATION_INDEX[0];
-    ADC_TOTALS_1[i] /= (float)ITERATION_INDEX[1];
-  }
-  return 0;
-}
-
 void clearADCAccumulators() {
   for (uint8_t i = 0; i < 8; i ++) {
-    ADC_TOTALS_0[i] = 0.0;
-    ADC_TOTALS_1[i] = 0.0;
+    ADC_TOTALS_0[i] = 0;
+    ADC_TOTALS_1[i] = 0;
   }
   ITERATION_INDEX[0] = 0;
   ITERATION_INDEX[1] = 0;
   return 0;
+}
+
+byte getReadyResponse(byte command) {
+  SPI.beginTransaction (SPISettings (300000, MSBFIRST, SPI_MODE1));
+  byte resp;
+  digitalWrite(_CS, LOW);
+  for (int i = 0; i < 30; i ++) {
+    resp = SPI.transfer(command);
+    if (resp == 0xF3) {
+      delayMicroseconds(10);
+      break;
+    } else {
+      delay(5);
+    }
+  }
+  return resp;
+}
+
+bool OPCN3_setOPCState(byte mode, bool on) {
+  // Mode byte 0 = fan, 1 = laser.
+  bool success = false;
+  byte ready_response;
+  while (success == false) {
+    ready_response = getReadyResponse(0x03);
+    if (ready_response == 0xF3) {
+      if (mode == 0) {
+        if (on == true) {
+          byte response = command_fanOn();
+          if (response == 0x03) {
+            success = true;
+          }
+        } else if (on == false) {
+          byte response = command_fanOff();
+          if (response == 0x03) {
+            success = true;
+          }
+        }
+      } else if (mode == 1) {
+        if (on == true) {
+          byte response = command_laserOn();
+          if (response == 0x03) {
+            success = true;
+          }
+        } else if (on == false) {
+          byte response = command_laserOff();
+          if (response == 0x03) {
+            success = true;
+          }
+        }
+      }
+    } else if (ready_response == 0x31) {
+      digitalWrite(_CS, HIGH);
+      delay(2500);
+    } else {
+      digitalWrite(_CS, HIGH);
+      SPI.endTransaction();
+      delay(5000);
+      SPI.beginTransaction (SPISettings (300000, MSBFIRST, SPI_MODE1));    }
+  }
+  if (success == false) {
+    //
+  }
+  SPI.endTransaction();
+  return success;
+}
+
+byte command_fanOn() {
+  byte resp = SPI.transfer(0x03);
+  digitalWrite(_CS, HIGH);
+  return resp;
+}
+
+byte command_fanOff() {
+  byte resp = SPI.transfer(0x02);
+  digitalWrite(_CS, HIGH);
+  return resp;
+}
+
+byte command_laserOn() {
+  byte resp = SPI.transfer(0x07);
+  digitalWrite(_CS, HIGH);
+  return resp;
+}
+
+byte command_laserOff() {
+  byte resp = SPI.transfer(0x06);
+  digitalWrite(_CS, HIGH);
+  return resp;
+}
+
+bool OPCN3_readHistogram() {
+  bool success = false;
+  byte ready_response = getReadyResponse(0x30);
+  
+  if (ready_response == 0xF3) {
+    for (byte spi_index = 0; spi_index < 86; spi_index ++) {
+      SPI_in[spi_index] = SPI.transfer(0x01);
+      delayMicroseconds(10);
+    }
+    digitalWrite(_CS, HIGH);
+    SPI.endTransaction();
+    success = true;
+  } else {
+    digitalWrite(_CS, HIGH);
+    SPI.endTransaction();
+  }
+  return success;
+}
+
+bool logOPCToSD(DateTime now, int log_index) {
+  bool success = false;
+  unsigned char i;
+  unsigned int *pUInt16;
+  float *pFloat;
+  float Afloat;
+
+  File DATA_FILE;
+  char string_buffer[13];
+  // Generate current logging filename.
+  sprintf(string_buffer, "%04d%02d%02d.%03d", now.year(), now.month(), now.day(), log_index);
+  DATA_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
+  
+  if (DATA_FILE) {
+    memcpy_P(string_buffer, F("<OPC>"), 6);
+    DATA_FILE.write(string_buffer, 5);
+    ultoa(now.unixtime(), string_buffer, 10);
+    DATA_FILE.write(string_buffer, 10);
+    DATA_FILE.write(',');
+    
+    //Histogram bins (UInt16) x16
+    for (i=0; i<48; i+=2) {
+      pUInt16 = (unsigned int *)&SPI_in[i];
+      utoa(*pUInt16, string_buffer, 10);
+      DATA_FILE.write(string_buffer, strlen(string_buffer));
+      DATA_FILE.write(',');
+    }
+    
+    //MToF bytes (UInt8) x4
+    for (i=48; i<52; i++) {
+      Afloat = (float)SPI_in[i];
+      Afloat /= 3; //convert to us
+      dtostrf(Afloat, 0, 2, string_buffer);
+      DATA_FILE.write(string_buffer, strlen(string_buffer));
+      DATA_FILE.write(',');
+    }
+    
+    //Sampling period(s) (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[52];
+    dtostrf((float)*pUInt16/100, 0, 3, string_buffer);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //SFR (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[54];
+    dtostrf((float)*pUInt16/100, 0, 3, string_buffer);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //Temperature (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[56];
+    dtostrf(ConvSTtoTemperature(*pUInt16), 0, 1, string_buffer);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //Relative humidity (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[58];
+    dtostrf(ConvSRHtoRelativeHumidity(*pUInt16), 0, 1, string_buffer);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //PM values(ug/m^3) (4-byte float) x3
+    for (i=60; i<72; i+=4) {
+      pFloat = (float *)&SPI_in[i];
+      dtostrf(*pFloat, 0, 3, string_buffer);
+      DATA_FILE.write(string_buffer, strlen(string_buffer));
+      DATA_FILE.write(',');
+    }
+    
+    //Reject count Glitch (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[72];
+    utoa(*pUInt16, string_buffer, 10);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //Reject count LongTOF (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[74];
+    utoa(*pUInt16, string_buffer, 10);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //Reject count Ratio (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[76];
+    utoa(*pUInt16, string_buffer, 10);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //Reject count OutOfRange (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[78];
+    utoa(*pUInt16, string_buffer, 10);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //Fan rev count (UInt16) x1 (Not using)
+    //AddDelimiter(port);
+    //pUInt16 = (unsigned int *)&SPI_in[80];
+    //port.print(*pUInt16, DEC);
+    
+    //Laser status (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[82];
+    utoa(*pUInt16, string_buffer, 10);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.write(',');
+    
+    //Checksum (UInt16) x1
+    pUInt16 = (unsigned int *)&SPI_in[84];
+    utoa(*pUInt16, string_buffer, 10);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.print("\r\n");;
+    
+    //Compare recalculated Checksum with one sent
+    if (*pUInt16 != MODBUS_CalcCRC(SPI_in, 84)) { //if checksums aren't equal
+      DATA_FILE.println(F("Checksum error in line above!"));
+    }
+    DATA_FILE.close();
+    success = true;
+  } else {
+    success = false;
+  }
+  return success;
+}
+
+//Convert SHT31 ST output to Temperature (C)
+float ConvSTtoTemperature (unsigned int ST)
+{
+  return -45 + 175*(float)ST/65535;
+}
+
+//Convert SHT31 SRH output to Relative Humidity (%)
+float ConvSRHtoRelativeHumidity (unsigned int SRH)
+{
+  return 100*(float)SRH/65535;
+}
+
+unsigned int MODBUS_CalcCRC(unsigned char data[], unsigned char nbrOfBytes)
+{
+  #define POLYNOMIAL_MODBUS 0xA001 //Generator polynomial for MODBUS crc
+  #define InitCRCval_MODBUS 0xFFFF //Initial CRC value
+
+  unsigned char _bit; // bit mask
+  unsigned int crc = InitCRCval_MODBUS; // initialise calculated checksum
+  unsigned char byteCtr; // byte counter
+
+  // calculates 16-Bit checksum with given polynomial
+  for(byteCtr = 0; byteCtr < nbrOfBytes; byteCtr++)
+  {
+    crc ^= (unsigned int)data[byteCtr];
+    for(_bit = 0; _bit < 8; _bit++)
+    {
+      if (crc & 1) //if bit0 of crc is 1
+      {
+        crc >>= 1;
+        crc ^= POLYNOMIAL_MODBUS;
+      }
+      else
+        crc >>= 1;
+    }
+  }
+  return crc;
 }
 

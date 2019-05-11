@@ -18,7 +18,7 @@ RTC_PCF8523 RTC;
 int RESET_WARNING = 0;
 unsigned long UC_TIMESTAMP;
 int REPEAT_COUNT = 0;
-unsigned long UPDATE_RATE_MSECS = 0;
+int32_t UPDATE_RATE_SECS = 2;
 unsigned long UPDATE_TIMESTAMP = 0;
 
 // ADC Measurement.
@@ -30,7 +30,7 @@ float ADC_TOTALS_1[8]={0.0, 0.0, 0.0, 0.0,
 uint8_t ADCS_PER_CHANNEL[4] = {4, 2, 1, 1};
 unsigned long ADC_TIMESTAMP = 0;
 unsigned long ADC_INTEGRATION_TIME_MSECS = 63;
-uint8_t SAMPLES_PER_ITERATION = 6;
+uint16_t ITERATION_INDEX[2] = {0, 0};
 
 // Inbound message handling.
 const int NUM_COMMANDS = 2;
@@ -178,14 +178,11 @@ bool logFileToSend(const char * characters) {
 
 void loop() {
   DateTime now = RTC.now();
+  DateTime last_time = now;
   UC_TIMESTAMP = millis();
   int log_index = getLogIndex();
   char filename[13] = "            ";
   uint8_t adc_mode = 0;
-  bool measuring = false;
-  uint8_t iteration_index = 0;
-  unsigned long test_timestamp = 0;
-  
   while (true) {
     // Listen for any new incoming characters over serial connection, set new mode appropriately.
     bool message_to_process;
@@ -231,76 +228,67 @@ void loop() {
     } else {
       applyCommand(COMMAND_MODE);
     }
+
+    adc_mode = readADCS(adc_mode);
     
-    DateTime last_time = now;
     now = RTC.now();
-    if (measuring == false) {
-      if (now.unixtime() > last_time.unixtime()) {
-        if (now.day() != last_time.day()) {        // If the day has changed since we last wrote measurements to the SD card, we've rolled-over Midnight, or changed the date,
-                                                  // so we start a new extension index and add the last filename to the 'to send' file.
-         sprintf(filename, "%04d%02d%02d.%03d", last_time.year(), last_time.month(), last_time.day(), log_index);
-         logFileToSend(filename);
-         log_index = 0;
-        }
-        measuring = true;
-        adc_mode = 0;
-        //test_timestamp = millis();
+    if (now.unixtime() >= (last_time.unixtime() + UPDATE_RATE_SECS)) {
+      last_time = now;
+      if (now.day() != last_time.day()) {        // If the day has changed since we last wrote measurements to the SD card, we've rolled-over Midnight, or changed the date,
+                                                 // so we start a new extension index and add the last filename to the 'to send' file.
+       sprintf(filename, "%04d%02d%02d.%03d", last_time.year(), last_time.month(), last_time.day(), log_index);
+       logFileToSend(filename);
+       log_index = 0;
       }
-    } else if (measuring == true) {
-      if (adc_mode == 0) {
-        clearADCAccumulators();
-        iteration_index = 0;
-        adc_mode = 1;
-      } else if (adc_mode == 1) {
-        startADCReadings(0);
-        ADC_TIMESTAMP = millis();
-        adc_mode = 2;
-      } else if (adc_mode == 2) {
-        temp_timestamp = millis();
-        if (temp_timestamp >= (ADC_TIMESTAMP + ADC_INTEGRATION_TIME_MSECS)) {
-          accumulateADCReadings(0);
-          adc_mode = 3;
-          //Serial.println(millis() - test_timestamp);
-        } else if (temp_timestamp < ADC_TIMESTAMP) {
-          // millis() must have wrapped-around. Check how long has actually elapsed since the last uc_timestamp by adding-up
-          // how much was left to elapse before millis() wrapped-around, and how much has elapsed since it wrapped-around.
-          unsigned long corrected_uc_timestamp = (4294967296L - ADC_TIMESTAMP) + temp_timestamp;
-          if (corrected_uc_timestamp > ADC_INTEGRATION_TIME_MSECS) {
-            ADC_TIMESTAMP = corrected_uc_timestamp;
-          }
-        }
-      } else if (adc_mode == 3) {
-        startADCReadings(1);
-        ADC_TIMESTAMP = millis();
-        adc_mode = 4;
-      } else if (adc_mode == 4) {
-        temp_timestamp = millis();
-        if (temp_timestamp >= (ADC_TIMESTAMP + ADC_INTEGRATION_TIME_MSECS)) {
-          accumulateADCReadings(1);
-          //Serial.println(millis() - test_timestamp);
-          if (iteration_index == (SAMPLES_PER_ITERATION - 1)) {
-            //Serial.println(millis() - test_timestamp);
-            averageADCAccumulators();
-            logToSD(now, log_index);
-            measuring = false;
-            //Serial.println(millis() - test_timestamp);
-            //Serial.println("---------------------------");
-          } else {
-            iteration_index += 1;
-            adc_mode = 1;
-          }
-        } else if (temp_timestamp < ADC_TIMESTAMP) {
-          // millis() must have wrapped-around. Check how long has actually elapsed since the last uc_timestamp by adding-up
-          // how much was left to elapse before millis() wrapped-around, and how much has elapsed since it wrapped-around.
-          unsigned long corrected_uc_timestamp = (4294967296L - ADC_TIMESTAMP) + temp_timestamp;
-          if (corrected_uc_timestamp > ADC_INTEGRATION_TIME_MSECS) {
-            ADC_TIMESTAMP = corrected_uc_timestamp;
-          }
-        }
-      }
+      averageADCAccumulators();
+      logToSD(now, log_index);
+      clearADCAccumulators();
     }
   }
   return 0;
+}
+
+uint8_t readADCS(uint8_t adc_mode) {
+  unsigned long temp_timestamp;
+  if (adc_mode == 0) {
+    startADCReadings(0);
+    ADC_TIMESTAMP = millis();
+    adc_mode = 1;
+  } else if (adc_mode == 1) {
+    temp_timestamp = millis();
+    if (temp_timestamp >= (ADC_TIMESTAMP + ADC_INTEGRATION_TIME_MSECS)) {
+      accumulateADCReadings(0);
+      ITERATION_INDEX[0] += 1;
+      adc_mode = 2;
+    } else if (temp_timestamp < ADC_TIMESTAMP) {
+      // millis() must have wrapped-around. Check how long has actually elapsed since the last uc_timestamp by adding-up
+      // how much was left to elapse before millis() wrapped-around, and how much has elapsed since it wrapped-around.
+      unsigned long corrected_uc_timestamp = (4294967296L - ADC_TIMESTAMP) + temp_timestamp;
+      if (corrected_uc_timestamp > ADC_INTEGRATION_TIME_MSECS) {
+        ADC_TIMESTAMP = corrected_uc_timestamp;
+      }
+    }
+  } else if(adc_mode == 2) {
+    startADCReadings(1);
+    ADC_TIMESTAMP = millis();
+    adc_mode = 3;
+  } else if (adc_mode == 3) {
+    temp_timestamp = millis();
+    if (temp_timestamp >= (ADC_TIMESTAMP + ADC_INTEGRATION_TIME_MSECS)) {
+      accumulateADCReadings(1);
+      //Serial.println(millis() - test_timestamp);
+      ITERATION_INDEX[1] += 1;
+      adc_mode = 0;
+    } else if (temp_timestamp < ADC_TIMESTAMP) {
+      // millis() must have wrapped-around. Check how long has actually elapsed since the last uc_timestamp by adding-up
+      // how much was left to elapse before millis() wrapped-around, and how much has elapsed since it wrapped-around.
+      unsigned long corrected_uc_timestamp = (4294967296L - ADC_TIMESTAMP) + temp_timestamp;
+      if (corrected_uc_timestamp > ADC_INTEGRATION_TIME_MSECS) {
+        ADC_TIMESTAMP = corrected_uc_timestamp;
+      }
+    }
+  }
+  return adc_mode;
 }
 
 bool logToSD(DateTime now, int log_index) {
@@ -318,14 +306,15 @@ bool logToSD(DateTime now, int log_index) {
     DATA_FILE.write(filename, 10);
     for (uint8_t measurement_index = 0; measurement_index < 8; measurement_index ++) {
       DATA_FILE.write(',');
-      dtostrf(ADC_TOTALS_0[measurement_index], 9, 2, filename);
-      DATA_FILE.write(filename, 9);
+      dtostrf(ADC_TOTALS_0[measurement_index], 0, 3, filename);
+      uint8_t val_length = strlen(filename);
+      DATA_FILE.write(filename, val_length);
       DATA_FILE.write(',');
-      dtostrf(ADC_TOTALS_1[measurement_index], 9, 2, filename);
-      DATA_FILE.write(filename, 9);
+      dtostrf(ADC_TOTALS_1[measurement_index], 0, 3, filename);
+      val_length = strlen(filename);
+      DATA_FILE.write(filename, val_length);
     }
-    DATA_FILE.print('\r');
-    DATA_FILE.print('\n');
+    DATA_FILE.write("\r\n", 2);
     DATA_FILE.close();
   }
   return success;
@@ -748,8 +737,8 @@ void accumulateADCReadings(uint8_t bank) {
 
 void averageADCAccumulators() {
   for (uint8_t i = 0; i < 8; i ++) {
-    ADC_TOTALS_0[i] /= (float)SAMPLES_PER_ITERATION;
-    ADC_TOTALS_1[i] /= (float)SAMPLES_PER_ITERATION;
+    ADC_TOTALS_0[i] /= (float)ITERATION_INDEX[0];
+    ADC_TOTALS_1[i] /= (float)ITERATION_INDEX[1];
   }
   return 0;
 }
@@ -759,6 +748,8 @@ void clearADCAccumulators() {
     ADC_TOTALS_0[i] = 0.0;
     ADC_TOTALS_1[i] = 0.0;
   }
+  ITERATION_INDEX[0] = 0;
+  ITERATION_INDEX[1] = 0;
   return 0;
 }
 

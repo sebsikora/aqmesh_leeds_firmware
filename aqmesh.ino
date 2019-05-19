@@ -14,9 +14,12 @@ Adafruit_ADS1115 ADCS[4] = {Adafruit_ADS1115(0x48),
                             Adafruit_ADS1115(0x4A),
                             Adafruit_ADS1115(0x4B)};
 
+// General.
+uint8_t WEB_UPDATE_RATE_MINS = 0;
+
 // OPC Measurement.
 uint8_t OPC_UPDATE_RATE_SECS = 5;
-int _CS = 4;
+int _CS = 9;
 char SPI_in[86];
 
 // ADC Measurement.
@@ -31,7 +34,7 @@ uint16_t ITERATION_INDEX[2] = {0, 0};
 // Inbound message handling.
 const int NUM_COMMANDS = 3;
 const int MAX_COMMAND_LENGTH = 2;
-const char COMMAND_STRINGS[NUM_COMMANDS][MAX_COMMAND_LENGTH] = {"ST", "TX", "CA"};
+const char COMMAND_STRINGS[NUM_COMMANDS][MAX_COMMAND_LENGTH] = {"ST", "TX", "CP"};
 const byte COMMAND_LENGTHS[NUM_COMMANDS] = {2, 2, 2};
 const int MAX_INPUT = 9;
 byte INPUT_MODE = 0;    // 0 = message, 1 = CRC8 check.
@@ -48,7 +51,9 @@ int TIMESTAMP_BUFFER[6];
 const char TIME_HEADER_STRINGS[6][2] = {"YY", "MM", "DD", "hh", "mm", "ss"};
 byte TIME_COMMAND_MODE = 0;     // 0 = Header, 1 = Value.
 bool CRC_SUCCESS = false;
-uint16_t NEW_UPDATE_RATE;
+const int NUM_PARAM_STRINGS = 3;
+const char PARAM_HEADER_STRINGS[NUM_PARAM_STRINGS][2] = {"AP", "OP", "UR"};
+byte PARAM_COMMAND_MODE = 0;
 
 // Outbound message handling.
 byte SPOOL_COMMAND_MODE = 0;
@@ -137,37 +142,45 @@ int getLogIndex() {
   }
   if (log_index > 0) {
     log_index = log_index - 1;
-    logTelemetry(F("AR"), 2);
+    logTelemetry(F("Arduino reset"));
   }
   return log_index;
 }
 
-bool logTelemetry(const char * characters, uint8_t buffer_length) {
+bool logTelemetry(const char * characters) {
   bool success = false;
   DateTime lognow;
   File LOG_FILE;
   // Get the current time from the RTC.
   lognow = RTC.now();
   char string_buffer[11];
-  memcpy_P(string_buffer, F("LOG.CSV"), 8);
+  strcpy_PF(string_buffer, F("LOG.CSV"));
   LOG_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
+  int n = 0;
+  for (const char * i = characters; *i != '\0'; i ++) {
+    n += 1;
+  }
   if (LOG_FILE) {
     success = true;
     ultoa(lognow.unixtime(), string_buffer, 10);
     LOG_FILE.write(string_buffer, 10);
     LOG_FILE.write(',');
-    LOG_FILE.write(characters, buffer_length);
+    LOG_FILE.write(characters, n);
     LOG_FILE.write("\r\n", 2);
     LOG_FILE.close();
   }
   return success;
 }
 
-void logTelemetry(const __FlashStringHelper* characters, const int len) {
+void logTelemetry(const __FlashStringHelper* characters) {
+  int len = 0;
+  for (const char PROGMEM *ptr = (const char PROGMEM *)characters; pgm_read_byte(ptr) != '\0'; ptr ++) {
+    len ++;
+  }
   char string_buffer[len + 1];
   memcpy_P(string_buffer, characters, len);
   string_buffer[len] = '\0';
-  logTelemetry(string_buffer, len);
+  logTelemetry(string_buffer);
   return 0;
 }
 
@@ -175,7 +188,7 @@ bool logFileToSend(const char * characters) {
   bool success = false;
   File SEND_FILE;
   char string_buffer[9];
-  memcpy_P(string_buffer, F("SEND.TXT"), 9);
+  strcpy_PF(string_buffer, F("SEND.TXT"));
   SEND_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
   if (SEND_FILE) {
     success = true;
@@ -211,14 +224,14 @@ void loop() {
           message_type = 0;
           mode = parseMessage(message_to_process, message_type);          // 0 = No change, 1 = Set time...
           if (mode == 0) {
-            serialSpeak(F("fl"), 2);
+            serialSpeak(F("fl"));
             COMMAND_MODE = 0;
           } else {
             if (mode == 1) {
-              serialSpeak(F("ak"), 2);
+              serialSpeak(F("ak"));
               COMMAND_MODE = 1;
               TIME_COMMAND_MODE = 0;
-              logTelemetry(F("TUS"), 3);
+              logTelemetry(F("Time update started"));
             }
             if (mode == 2) {
               now = RTC.now();
@@ -227,19 +240,20 @@ void loop() {
               log_index ++;                                                                                       // a new logging file (todays date, index incremented).
               COMMAND_MODE = 2;
               SPOOL_COMMAND_MODE = 0;
-              logTelemetry(F("TXS"), 3);
+              logTelemetry(F("Data transmission started"));
             }
             if (mode == 3) {
-              serialSpeak(F("ak"), 2);
+              serialSpeak(F("ak"));
               COMMAND_MODE = 3;
-              logTelemetry(F("CAS"), 3);
+              PARAM_COMMAND_MODE = 0;
+              logTelemetry(F("Parameter change started"));
             }
-            COMMAND_START_TIMESTAMP = millis();
           }
         } else if (CRC_SUCCESS == false) {
-          serialSpeak(F("fl"), 2);
+          serialSpeak(F("fl"));
           COMMAND_MODE = 0;
         }
+        COMMAND_START_TIMESTAMP = millis();
         for (int j = 0; j < MAX_INPUT; j ++) {
           INPUT_MESSAGE_BUFFER[j] = '\0';
         }
@@ -325,7 +339,7 @@ bool logADCSToSD(DateTime now, int log_index) {
   DATA_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
   if (DATA_FILE) {
     success = true;
-    memcpy_P(string_buffer, F("(ADCS)"), 7);
+    strcpy_PF(string_buffer, F("(ADCS)"));
     DATA_FILE.write(string_buffer, 6);
     ultoa(now.unixtime(), string_buffer, 10);
     DATA_FILE.write(string_buffer, 10);
@@ -428,7 +442,11 @@ void serialSpeak(const char * characters) {
   return 0;
 }
 
-void serialSpeak(const __FlashStringHelper* characters, const int len) {
+void serialSpeak(const __FlashStringHelper* characters) {
+  int len = 0;
+  for (const char PROGMEM *ptr = (const char PROGMEM *)characters; pgm_read_byte(ptr) != '\0'; ptr ++) {
+    len ++;
+  }
   char string_buffer[len + 1];
   memcpy_P(string_buffer, characters, len);
   string_buffer[len] = '\0';
@@ -458,6 +476,12 @@ int parseMessage(bool message_to_process, byte message_type) {
           new_mode = i + 1;
         }
       }
+    } else if (message_type == 3) {
+      for (int i = 0; i < NUM_PARAM_STRINGS; i ++) {
+        if (strncmp(PARAM_HEADER_STRINGS[i], INPUT_MESSAGE_BUFFER, 2) == 0) {
+          new_mode = i + 1;
+        }
+      }
     }
   }
   return new_mode;
@@ -475,37 +499,111 @@ void applyCommand(int new_mode) {
       spoolFiles();
       break;
     case 3:
-      setADCAveragingPeriod();
+      setParameter();
       break;
   }
   return 0;
-}
+} 
 
-void setADCAveragingPeriod() {
+void setParameter() {
   bool message_to_process = false;
   byte message_type = 0;
   message_to_process = serialListen(false);
   if ((message_to_process == true) && (CRC_SUCCESS == true)) {
-    byte mode = parseMessage(message_to_process, message_type);         // Parse message against base commands.
-    if (mode != 0) {                                                    // If RPI is still sending CA command, must not have received last ack from arduino...
-      COMMAND_MODE = 0;                                                 // Break out of CA command mode.
-      serialSpeak(F("m2"), 2);                                              // Send nack to arduino so CA command is re-sent.
-    } else {
-      message_type = 2;
-      byte new_mode =  parseMessage(message_to_process, message_type);  // Parse message against TX commands (to check for AK or CC).
-      if (new_mode == 0) {                                              // If not recognised...
-        NEW_UPDATE_RATE = atoi(INPUT_MESSAGE_BUFFER);                       // New averaging period sent by RPI. Store it.
-        serialSpeak(F("fs"), 2);                                            // Signal completion.
-      } else if (new_mode == 3) {                                       // RPI has received completion signal from arduino and asked for completion confirmation.
-        serialSpeak(F("cc"), 2);                                            // Send completion confirmation.
-        ADC_UPDATE_RATE_SECS = NEW_UPDATE_RATE;                             // Set the new value.
-        logTelemetry(F("CAC"), 3);
-        COMMAND_MODE = 0;                                                   // Break out of CA command mode.
+    if (PARAM_COMMAND_MODE == 0) {
+      message_type = 0;
+      byte mode = parseMessage(message_to_process, message_type);         // Parse message against base commands.
+      if (mode != 0) {                                                    // If RPI is still sending CP command, must not have received last ack from arduino...
+        COMMAND_MODE = 0;                                                     // Break out of CP command mode.
+        serialSpeak(F("sp1"));                                             // Send nack to arduino so CA command is re-sent.
+      } else {
+        message_type = 3;
+        byte new_mode =  parseMessage(message_to_process, message_type);  // Parse message against parameter headers.
+        if (new_mode == 0) {                                              // If not recognised...
+          serialSpeak(F("sp2"));                                           // Send nack to RPI so parameter header is re-sent.
+        } else if (new_mode != 0) {                                       // We have received a recognised parameter header
+          serialSpeak(F("ak"));                                            // Send ack to RPI.
+          PARAM_COMMAND_MODE = new_mode;                                      // Set the appropriate parameter change mode.
+        }
       }
+    } else if ((PARAM_COMMAND_MODE == 1) || (PARAM_COMMAND_MODE == 2) || (PARAM_COMMAND_MODE == 3)) {
+      message_type = 3;
+      byte mode = parseMessage(message_to_process, message_type);         // Parse message against parameter headers.
+      if (mode != 0) {                                                    // If RPI is still sending a parameter header, must not have received last ack from arduino...
+        serialSpeak(F("ak"));                                              // Send ack to RPI so parameter value is sent.
+      } else {                                                            // We have received a parameter value to apply.
+        if (PARAM_COMMAND_MODE == 1) {                                        // If we are changing the ADC averaging period.
+          uint16_t new_adc_update_rate = atoi(INPUT_MESSAGE_BUFFER);              // Get the new value from the input buffer.
+                                                                                      // If atoi() cannot perform a valid conversion, it returns zero, so the following
+                                                                                      // conditional will catch these too.
+          if (new_adc_update_rate < 1) {                                          // Cap the value between 1 and 60 seconds.
+            new_adc_update_rate = 1;
+          } else if (new_adc_update_rate > 60) {
+            new_adc_update_rate = 60;
+          }
+          ADC_UPDATE_RATE_SECS = new_adc_update_rate;                             // Apply the new value.
+          const __FlashStringHelper* flash_string = F("ADC averaging period set to ");
+          char msg_string[strlen_PF(flash_string) + 3];
+          strcpy_PF(msg_string, flash_string);
+          char value_string[3];
+          utoa(ADC_UPDATE_RATE_SECS, value_string, 10);
+          strcat(msg_string, value_string);
+          logTelemetry(msg_string);
+        } else if (PARAM_COMMAND_MODE == 2) {                                 // If we are changing the OPC integration time.
+          uint8_t new_opc_update_rate = atoi(INPUT_MESSAGE_BUFFER);               // Get the new value from the input buffer.
+          if (new_opc_update_rate < 1) {                                          // Cap the value between 1 and 60 seconds.
+            new_opc_update_rate = 1;
+          } else if (new_opc_update_rate > 60) {
+            new_opc_update_rate = 60;
+          }
+          OPC_UPDATE_RATE_SECS = new_opc_update_rate;                             // Apply the new value.
+          const __FlashStringHelper* flash_string = F("OPC integration time set to ");
+          char msg_string[strlen_PF(flash_string) + 3];
+          strcpy_PF(msg_string, flash_string);
+          char value_string[3];
+          utoa(OPC_UPDATE_RATE_SECS, value_string, 10);
+          strcat(msg_string, value_string);
+          logTelemetry(msg_string);
+        } else if (PARAM_COMMAND_MODE == 3) {                                        // If we are changing the web update rate.
+          uint16_t new_web_update_rate = atoi(INPUT_MESSAGE_BUFFER);              // Get the new value from the input buffer.
+                                                                                      // If atoi() cannot perform a valid conversion, it returns zero, so the following
+                                                                                      // conditional will catch these too.
+          if (new_web_update_rate < 5) {                                          // Cap the value between 1 and 60 seconds.
+            new_web_update_rate = 5;
+          } else if (new_web_update_rate > 240) {
+            new_web_update_rate = 240;
+          }
+          WEB_UPDATE_RATE_MINS = new_web_update_rate;                             // Apply the new value.
+          const __FlashStringHelper* flash_string = F("Web update rate set to ");
+          char msg_string[strlen_PF(flash_string) + 4];
+          strcpy_PF(msg_string, flash_string);
+          char value_string[4];
+          utoa(ADC_UPDATE_RATE_SECS, value_string, 10);
+          strcat(msg_string, value_string);
+          logTelemetry(msg_string);
+        }
+        PARAM_COMMAND_MODE = 4;
+        serialSpeak(F("fs"));
+      }
+    } else if (PARAM_COMMAND_MODE == 4) {
+      message_type = 2;
+      byte mode = parseMessage(message_to_process, message_type);         // Parse message against spool commands.
+      if (mode == 1) {                                                    // If RPI sends ack.
+        serialSpeak(F("ak"));                                            // Send ack to RPI and we are done.
+        COMMAND_MODE = 0;                                                   // Break out of parameter change mode.
+      } else {                                                            // If otherwise not recognised.
+        serialSpeak(F("sp3"));                                            // Send nack to RPI.
+      }
+    }
+    for (int j = 0; j < MAX_INPUT; j ++) {
+      INPUT_MESSAGE_BUFFER[j] = '\0';
     }
     COMMAND_START_TIMESTAMP = millis();
   } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {  // Whatever it was arrived garbled, send an nak to the RPI.
-    serialSpeak(F("m5"), 2);                                                // Send nack to RPI.
+    serialSpeak(F("sp4"));                                                // Send nack to RPI.
+    for (int j = 0; j < MAX_INPUT; j ++) {
+      INPUT_MESSAGE_BUFFER[j] = '\0';
+    }
     COMMAND_START_TIMESTAMP = millis();
   }
   checkCommandTimeout();
@@ -524,16 +622,16 @@ void setTime() {
       mode = parseMessage(message_to_process, message_type);            // 0 = No change, 1 = Set time (ST), 2 = Spool data (TX), 3 = Set ADC averaging period (CA).
       if (mode != 0) {                                                  // If RPI is still sending ST command, must not have received last ack from arduino...
         COMMAND_MODE = 0;                                                 // Break out of ST command mode.
-        serialSpeak(F("m2"), 2);                                          // Send nack to arduino so ST command is re-sent.
+        serialSpeak(F("m2"));                                          // Send nack to arduino so ST command is re-sent.
       } else if (mode == 0) {                                           // If RPI is not still sending ST command, must have received last ack from arduino...
         message_type = 1;                                                 // Parsing message against time headers.
         mode = parseMessage(message_to_process, message_type);            // 0 = Not recognised, 1 = Year, 2 = Month, 3 = Day, 4 = Hour, 5 = Minute, 6 = Second.
         if (mode != 0) {                                                  // If time header successfully parsed...
           COMMAND_STAGE = mode - 1;
           TIME_COMMAND_MODE = 1;                                            // Switch to receiving time values instead of time headers.
-          serialSpeak(F("ht"), 2);                                          // Send ack to RPI.
+          serialSpeak(F("ht"));                                          // Send ack to RPI.
         } else if (mode == 0) {                                           // If time header not recognised...
-          serialSpeak(F("m3"), 2);                                          // Send nack to RPI so header is re-sent.
+          serialSpeak(F("m3"));                                          // Send nack to RPI so header is re-sent.
         }
       }
     } else if (TIME_COMMAND_MODE == 1) {                              // If we are waiting to receive a time value...
@@ -541,18 +639,27 @@ void setTime() {
       mode = parseMessage(message_to_process, message_type);            // 0 = Not recognised, 1 = Year, 2 = Month, 3 = Day, 4 = Hour, 5 = Minute, 6 = Second.
       if (mode != 0) {                                                  // If RPI is still sending time header, must not have received last ack from arduino...
         TIME_COMMAND_MODE = 0;                                            // Switch to receiving time headers instead of time values.
-        serialSpeak(F("m4"), 2);                                          // Send nack to RPI.
+        serialSpeak(F("m4"));                                          // Send nack to RPI.
       } else if (mode == 0) {                                           // If RPI is sending values...
         TIMESTAMP_BUFFER[COMMAND_STAGE] = atoi(INPUT_MESSAGE_BUFFER);     // Convert value from char array to int.
         TIME_COMMAND_MODE = 0;                                            // Switch back to receiving time headers.
         if (COMMAND_STAGE == 5) {                                         // If this is the last time value to get...   (assumes headers are dispatched in order!)
-          COMMAND_MODE = 0;                                                 // Break out of ST command mode.
           RTC.adjust(DateTime(TIMESTAMP_BUFFER[0], TIMESTAMP_BUFFER[1], TIMESTAMP_BUFFER[2], TIMESTAMP_BUFFER[3], TIMESTAMP_BUFFER[4], TIMESTAMP_BUFFER[5]));   // Set the time.
-          serialSpeak(F("ts"), 2);                                          // Send final ack to RPI.
-          logTelemetry(F("TUC"), 3);
+          serialSpeak(F("fs"));                                          // Send final ack to RPI.
+          logTelemetry(F("Time update complete"));                       // Log the time update.
+          TIME_COMMAND_MODE = 2;                                            // Switch to time update handshake mode.
         } else if (COMMAND_STAGE < 5) {                                   // If this is not the last time value to get...
-          serialSpeak(F("ht"), 2);                                          // Send ack to RPI.
+          serialSpeak(F("ht"));                                          // Send ack to RPI.
         }
+      }
+    } else if (TIME_COMMAND_MODE == 2) {                              // If we are handshaking.
+      message_type = 2;                                                 // Parse message against spool commands.
+      mode = parseMessage(message_to_process, message_type);            // 
+      if (mode == 1) {                                                  // If RPI sent ack,
+        serialSpeak(F("ak"));                                          // Send ack to RPI and we are done.
+        COMMAND_MODE = 0;                                                 // Break out of ST command mode.
+      } else {                                                          // If otherwise not recognised.
+        serialSpeak(F("sp3"));                                         // Send nack to RPI.
       }
     }
     for (int j = 0; j < MAX_INPUT; j ++) {
@@ -560,7 +667,7 @@ void setTime() {
     }
     COMMAND_START_TIMESTAMP = millis();
   } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {  // Whatever it was arrived garbled, send an nak to the RPI.
-    serialSpeak(F("m5"), 2);                                              // Send nack to RPI.
+    serialSpeak(F("m5"));                                              // Send nack to RPI.
     for (int j = 0; j < MAX_INPUT; j ++) {
       INPUT_MESSAGE_BUFFER[j] = '\0';
     }
@@ -576,7 +683,7 @@ bool spoolFiles() {
     // Open SEND file and read the next 13 characters from it into a filename buffer.
     File SEND_FILE;
     char string_buffer[9];
-    memcpy_P(string_buffer, F("SEND.TXT"), 9);
+    strcpy_PF(string_buffer, F("SEND.TXT"));
     SEND_FILE = SD.open(string_buffer);
     if (SEND_FILE) {
       unsigned long send_file_size = SEND_FILE.size();
@@ -603,7 +710,7 @@ bool spoolFiles() {
         SPOOL_COMMAND_MODE = 1;                                             // Switch to 'Send file index' mode.
       } else {
         success = true;
-        serialSpeak(F("fs"), 2);                                                  // No more files in the SEND file list, signal to RPI we are finished.
+        serialSpeak(F("fs"));                                                  // No more files in the SEND file list, signal to RPI we are finished.
         SEND_FILE_CURSOR = 0;                                               // Zero the SEND file cursor.
         SPOOL_COMMAND_MODE = 5;                                             // Switch to 'Completion handshake' mode.
       }
@@ -672,7 +779,7 @@ bool spoolFiles() {
         message_type = 2;                                                   // Otherwise, parse message against TX commands.
         byte new_mode = parseMessage(message_to_process, message_type);     // 0 = Not recognised, 1 = Acknowledge frame (AK), 2 = Acknowledge resend (AR), 3 = TX completed (CC).
         if (new_mode == 0) {                                                // CRC check passed but command not recognised, confirm resend.
-          serialSpeak(F("cr"), 2);
+          serialSpeak(F("cr"));
           SPOOL_COMMAND_MODE = 4;
         } else if (new_mode == 1) {                                         // AK received from RPI...
           if (EOF_FLAG == false) {
@@ -687,7 +794,7 @@ bool spoolFiles() {
       }
       COMMAND_START_TIMESTAMP = millis();
     } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {        // If message from RPI fails its CRC check, confirm resend.
-      serialSpeak(F("cr"), 2);
+      serialSpeak(F("cr"));
       SPOOL_COMMAND_MODE = 4;
       COMMAND_START_TIMESTAMP = millis();
     }
@@ -698,18 +805,18 @@ bool spoolFiles() {
       byte message_type = 2;                                                  // Parse message against TX commands.
       int mode = parseMessage(message_to_process, message_type);              // 0 = Not recognised, 1 = Acknowledge frame (AK), 2 = Acknowledge resend (AR), 3 = TX completed (CC).
       if (mode == 0) {                                                        // CRC check passed but command not recognised, confirm completion.
-        serialSpeak(F("fs"), 2);
+        serialSpeak(F("fs"));
       } else if (mode == 3) {                                                 // CC received from RPI, transmission complete!
-        serialSpeak(F("cc"), 2);                                                  // Send final confirmation.
+        serialSpeak(F("cc"));                                                  // Send final confirmation.
         char string_buffer[9];
-        memcpy_P(string_buffer, F("SEND.TXT"), 9);
+        strcpy_PF(string_buffer, F("SEND.TXT"));
         SD.remove(string_buffer);
-        logTelemetry(F("TXC"), 3);
+        logTelemetry(F("Data transmission complete"));
         COMMAND_MODE = 0;                                                   // Switch back to base command mode.
       }
       COMMAND_START_TIMESTAMP = millis();
     } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {        // If message from RPI fails its CRC check, confirm completion.
-      serialSpeak(F("fs"), 2);
+      serialSpeak(F("fs"));
       COMMAND_START_TIMESTAMP = millis();
     }
   }
@@ -722,8 +829,8 @@ bool checkCommandTimeout() {
   unsigned long current_timestamp = millis();
   if (current_timestamp > (COMMAND_START_TIMESTAMP + 500L)) {
     COMMAND_MODE = 0;
-    serialSpeak(F("to"), 2);
-    logTelemetry(F("CTO"), 3);
+    serialSpeak(F("to"));
+    logTelemetry(F("Command timeout"));
     timeout = true;
   } else if (current_timestamp < COMMAND_START_TIMESTAMP) {
     // millis() must have overflowed. Correct for this.
@@ -931,7 +1038,7 @@ bool logOPCToSD(DateTime now, int log_index) {
   DATA_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
   
   if (DATA_FILE) {
-    memcpy_P(string_buffer, F("(OPC)"), 6);
+    strcpy_PF(string_buffer, F("(OPC)"));
     DATA_FILE.write(string_buffer, 5);
     ultoa(now.unixtime(), string_buffer, 10);
     DATA_FILE.write(string_buffer, 10);
@@ -1077,4 +1184,3 @@ unsigned int MODBUS_CalcCRC(unsigned char data[], unsigned char nbrOfBytes)
   }
   return crc;
 }
-

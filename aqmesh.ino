@@ -14,11 +14,8 @@ Adafruit_ADS1115 ADCS[4] = {Adafruit_ADS1115(0x48),
                             Adafruit_ADS1115(0x4A),
                             Adafruit_ADS1115(0x4B)};
 
-// General.
-uint8_t WEB_UPDATE_RATE_MINS = 0;
-
 // OPC Measurement.
-uint8_t OPC_UPDATE_RATE_SECS = 5;
+uint8_t OPC_UPDATE_RATE_SECS = 10;
 int _CS = 9;
 char SPI_in[86];
 
@@ -30,6 +27,13 @@ const uint8_t ADCS_PER_CHANNEL[4] = {4, 2, 1, 1};
 unsigned long ADC_TIMESTAMP = 0;
 const unsigned long ADC_INTEGRATION_TIME_MSECS = 63;
 uint16_t ITERATION_INDEX[2] = {0, 0};
+
+// Battery voltage measurement.
+const int PIN_BATT_VPLUS = A2;
+uint8_t BATT_UPDATE_RATE_SECS = 30;
+uint8_t BATT_ITERATION_INDEX = 0;
+uint32_t BATT_TOTAL = 0;
+unsigned long BATT_TIMESTAMP = 0;
 
 // Inbound message handling.
 const int NUM_COMMANDS = 3;
@@ -69,9 +73,14 @@ unsigned long SEND_FILE_CURSOR = 0;
 unsigned long DATA_FILE_CURSOR = 0;
 bool EOF_FLAG = false;
 
-// Pins
-const int PIN_RPI_CONNECTED = 4;
-const int PIN_RPI_HARDWARE_RUN = 5;
+// RPI control.
+unsigned long RPI_TIMESTAMP = 0;
+byte RPI_MODE = 0;    // 0 = Off, 1 = Booting up, 2 = Running, 3 = Shutting down.
+uint8_t RPI_UPDATE_RATE_MINS = 15;
+const int PIN_RPI_RUNNING = 5;
+const int PIN_RPI_POWER = 8;
+
+// Misc pins
 const int PIN_RTC_FAIL_WARN = 6;
 const int PIN_SD_FAIL_WARN = 7;
 
@@ -79,11 +88,20 @@ void setup() {
   // Setup pins.
   digitalWrite(_CS, HIGH);
   pinMode(_CS, OUTPUT);
-  pinMode(PIN_RPI_CONNECTED, INPUT_PULLUP);
-  pinMode(PIN_RTC_FAIL_WARN, OUTPUT);
+
+  digitalWrite(PIN_RPI_POWER, HIGH);
+  pinMode(PIN_RPI_POWER, OUTPUT);
+  
   digitalWrite(PIN_RTC_FAIL_WARN, LOW);
-  pinMode(PIN_SD_FAIL_WARN, OUTPUT);
   digitalWrite(PIN_SD_FAIL_WARN, LOW);
+  
+  pinMode(PIN_RTC_FAIL_WARN, OUTPUT);
+  pinMode(PIN_SD_FAIL_WARN, OUTPUT);
+  
+  digitalWrite(PIN_RPI_RUNNING, LOW);
+  pinMode(PIN_RPI_RUNNING, INPUT);
+
+  pinMode(PIN_BATT_VPLUS, INPUT);
   
   Serial.begin(115200);
   delay(500);
@@ -118,6 +136,38 @@ void setup() {
   if (! (fan_state && laser_state)) {
     //Serial.println(F("Could not start OPC."));
     while (true) {}
+  }
+
+  RPI_TIMESTAMP = millis();
+  BATT_TIMESTAMP = millis();
+}
+
+void serviceRPI() {
+  unsigned long current_timestamp = millis();
+  if (RPI_MODE == 0) {
+    if (current_timestamp >= (RPI_TIMESTAMP + (((unsigned long)RPI_UPDATE_RATE_MINS) * 60000L))) {
+      RPI_MODE = 1;
+      digitalWrite(PIN_RPI_POWER, LOW);
+      logTelemetry(F("RPI powering up"));
+    }
+  } else if (RPI_MODE == 1) {
+    if (digitalRead(PIN_RPI_RUNNING) == HIGH) {
+      RPI_MODE = 2;
+      logTelemetry(F("RPI running"));
+    }
+  } else if (RPI_MODE == 2) {
+    if (digitalRead(PIN_RPI_RUNNING) == LOW) {
+      RPI_MODE = 3;
+      RPI_TIMESTAMP = millis();
+      logTelemetry(F("RPI powering down"));
+    }
+  } else if (RPI_MODE == 3) {
+    if (current_timestamp >= (RPI_TIMESTAMP + 60000L)) {
+      digitalWrite(PIN_RPI_POWER, HIGH);
+      RPI_MODE = 0;
+      RPI_TIMESTAMP = millis();
+      logTelemetry(F("RPI powered down"));
+    }
   }
 }
 
@@ -206,6 +256,7 @@ void loop() {
   DateTime last_time = now;
   int32_t adc_last_time = now.unixtime();
   int32_t opc_last_time = now.unixtime();
+  int32_t batt_last_time = now.unixtime();
   uint8_t file_change_last_day = now.day();
   int log_index = getLogIndex();
   char filename[13];
@@ -216,6 +267,8 @@ void loop() {
     int mode;
     byte message_type;
     unsigned long temp_timestamp;
+    
+    serviceRPI();
     
     if (COMMAND_MODE == 0) {      // Idle, waiting for commands...
       message_to_process = serialListen(false);
@@ -263,9 +316,10 @@ void loop() {
     }
 
     adc_mode = readADCS(adc_mode);
+    averageBattVolt();
     
     now = RTC.now();
-    if ((now.unixtime() >= (adc_last_time + (int32_t)ADC_UPDATE_RATE_SECS)) || (now.unixtime() >= (opc_last_time + (int32_t)OPC_UPDATE_RATE_SECS))) {
+    if ((now.unixtime() >= (adc_last_time + (int32_t)ADC_UPDATE_RATE_SECS)) || (now.unixtime() >= (opc_last_time + (int32_t)OPC_UPDATE_RATE_SECS)) || (now.unixtime() >= (batt_last_time + (int32_t)BATT_UPDATE_RATE_SECS))) {
       if (now.day() != file_change_last_day) {        // If the day has changed since we last wrote measurements to the SD card, we've rolled-over Midnight, or changed the date,
                                                       // so we start a new extension index and add the last filename to the 'to send' file.
        sprintf(filename, "%04d%02d%02d.%03d", last_time.year(), last_time.month(), last_time.day(), log_index);
@@ -282,6 +336,10 @@ void loop() {
         bool success = OPCN3_readHistogram();
         success = logOPCToSD(now, log_index);
         opc_last_time = now.unixtime();
+      }
+      if (now.unixtime() >= (batt_last_time + (int32_t)BATT_UPDATE_RATE_SECS)) {
+        bool success = logBattVoltToSD(now, log_index);
+        batt_last_time = now.unixtime();
       }
     }
   }
@@ -573,8 +631,8 @@ void setParameter() {
           } else if (new_web_update_rate > 240) {
             new_web_update_rate = 240;
           }
-          WEB_UPDATE_RATE_MINS = new_web_update_rate;                             // Apply the new value.
-          const __FlashStringHelper* flash_string = F("Web update rate set to ");
+          RPI_UPDATE_RATE_MINS = new_web_update_rate;                             // Apply the new value.
+          const __FlashStringHelper* flash_string = F("RPI update rate set to ");
           char msg_string[strlen_PF(flash_string) + 4];
           strcpy_PF(msg_string, flash_string);
           char value_string[4];
@@ -1183,4 +1241,48 @@ unsigned int MODBUS_CalcCRC(unsigned char data[], unsigned char nbrOfBytes)
     }
   }
   return crc;
+}
+
+void averageBattVolt() {
+  unsigned long temp_timestamp = millis();
+  if (temp_timestamp >= (BATT_TIMESTAMP + 1000)) {
+    BATT_TOTAL += (uint32_t)analogRead(A1);
+    BATT_ITERATION_INDEX += 1;
+    BATT_TIMESTAMP = millis();
+  } else if (temp_timestamp < BATT_TIMESTAMP) {
+    // millis() must have wrapped-around. Check how long has actually elapsed since the last uc_timestamp by adding-up
+    // how much was left to elapse before millis() wrapped-around, and how much has elapsed since it wrapped-around.
+    unsigned long corrected_timestamp = (4294967296L - BATT_TIMESTAMP) + temp_timestamp;
+    BATT_TIMESTAMP = corrected_timestamp;
+  }
+  return 0;
+}
+
+bool logBattVoltToSD(DateTime now, int log_index) {
+  bool success = false;
+  float voltage_raw = ((float)BATT_TOTAL) / ((float)BATT_ITERATION_INDEX);
+  float voltage = (5.0 / 1023.0) * voltage_raw * 3.0;
+  BATT_ITERATION_INDEX = 0;
+  BATT_TOTAL = 0;
+  File DATA_FILE;
+  char string_buffer[13];
+  // Generate current logging filename.
+  sprintf(string_buffer, "%04d%02d%02d.%03d", now.year(), now.month(), now.day(), log_index);
+  DATA_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
+  
+  if (DATA_FILE) {
+    strcpy_PF(string_buffer, F("(BATT)"));
+    DATA_FILE.write(string_buffer, 6);
+    ultoa(now.unixtime(), string_buffer, 10);
+    DATA_FILE.write(string_buffer, 10);
+    DATA_FILE.write(',');
+    dtostrf(voltage, 0, 3, string_buffer);
+    DATA_FILE.write(string_buffer, strlen(string_buffer));
+    DATA_FILE.print("\r\n");;
+    DATA_FILE.close();
+    success = true;
+  } else {
+    success = false;
+  }
+  return success;
 }

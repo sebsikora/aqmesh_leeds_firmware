@@ -15,23 +15,24 @@ Adafruit_ADS1115 ADCS[4] = {Adafruit_ADS1115(0x48),
                             Adafruit_ADS1115(0x4B)};
 
 // OPC Measurement.
-uint8_t OPC_UPDATE_RATE_SECS = 10;
+uint8_t OPC_UPDATE_RATE_SECS = 30;
 int _CS = 9;
+//int PIN_OPC_POWER = A1;
 char SPI_in[86];
 
 // ADC Measurement.
-int32_t ADC_TOTALS_0[8]={0, 0, 0, 0, 0, 0, 0, 0};
-int32_t ADC_TOTALS_1[8]={0, 0, 0, 0, 0, 0, 0, 0};
-uint16_t ADC_UPDATE_RATE_SECS = 2;
-const uint8_t ADCS_PER_CHANNEL[4] = {4, 2, 1, 1};
+uint16_t ADC_UPDATE_RATE_SECS = 10;
+const uint8_t ADC_COUNT = 15;
+int32_t ADC_TOTALS[ADC_COUNT]={0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+const uint8_t ADCS_PER_CHANNEL[4] = {4, 4, 4, 3};
 unsigned long ADC_TIMESTAMP = 0;
-const unsigned long ADC_INTEGRATION_TIME_MSECS = 63;
-uint16_t ITERATION_INDEX[2] = {0, 0};
+const unsigned long ADC_INTEGRATION_TIME_MSECS = 126;
+uint16_t ITERATION_INDEX = 0;
 
 // Battery voltage measurement.
-const int PIN_BATT_VPLUS = A2;
+const int PIN_BATT_VPLUS = A1;
 uint8_t BATT_UPDATE_RATE_SECS = 30;
-uint8_t BATT_ITERATION_INDEX = 0;
+uint16_t BATT_ITERATION_INDEX = 0;
 uint32_t BATT_TOTAL = 0;
 unsigned long BATT_TIMESTAMP = 0;
 
@@ -68,16 +69,15 @@ const byte SPOOL_COMMAND_LENGTHS[NUM_SPOOL_COMMANDS] = {2, 2, 2};
 const byte OUTPUT_PACKET_LENGTH = 128;
 char OUTPUT_BUFFER[OUTPUT_PACKET_LENGTH + 1];
 char FILENAME_BUFFER[13];
-char SEND_FILE_INDEX_BUFFER[4];
 unsigned long SEND_FILE_CURSOR = 0;
 unsigned long DATA_FILE_CURSOR = 0;
 bool EOF_FLAG = false;
 
 // RPI control.
-unsigned long RPI_TIMESTAMP = 0;
+uint8_t RPI_UPDATE_RATE_MINS = 5;
+unsigned long RPI_MODE_TIMESTAMP = 0;
 byte RPI_MODE = 0;    // 0 = Off, 1 = Booting up, 2 = Running, 3 = Shutting down.
-uint8_t RPI_UPDATE_RATE_MINS = 15;
-const int PIN_RPI_RUNNING = 5;
+const int PIN_RPI_RUNNING = 2;
 const int PIN_RPI_POWER = 8;
 
 // Misc pins
@@ -88,9 +88,12 @@ void setup() {
   // Setup pins.
   digitalWrite(_CS, HIGH);
   pinMode(_CS, OUTPUT);
-
+  
   digitalWrite(PIN_RPI_POWER, HIGH);
   pinMode(PIN_RPI_POWER, OUTPUT);
+  
+//  digitalWrite(PIN_OPC_POWER, LOW);
+//  pinMode(PIN_OPC_POWER, OUTPUT);
   
   digitalWrite(PIN_RTC_FAIL_WARN, LOW);
   digitalWrite(PIN_SD_FAIL_WARN, LOW);
@@ -100,21 +103,20 @@ void setup() {
   
   digitalWrite(PIN_RPI_RUNNING, LOW);
   pinMode(PIN_RPI_RUNNING, INPUT);
-
+  
   pinMode(PIN_BATT_VPLUS, INPUT);
   
-  Serial.begin(115200);
+  Serial.begin(115200L);
   delay(500);
   
   // Initialise Real Time Clock.
   if (! RTC.begin()) {
-    //Serial.println(F("Couldn't initialise RTC..."));
     digitalWrite(PIN_RTC_FAIL_WARN, HIGH);
     while (1);
   }
+  
   // INITIALISE SD CARD:
   if (! SD.begin(SD_CS_PIN)) {
-    //Serial.println(F("Couldn't initialise SD card..."));
     digitalWrite(PIN_SD_FAIL_WARN, HIGH);
     while (true) {}
   }
@@ -124,28 +126,29 @@ void setup() {
   initialiseChannel(1);
   initialiseChannel(2);
   initialiseChannel(3);
-
+  
   // Set I2C clock frequency above the default.
-  Wire.setClock(800000L);
-
+  Wire.setClock(400000L);
+  
   // Start-up the OPC.
   bool fan_state = OPCN3_setOPCState(0, true);
   delay(5000);
   bool laser_state = OPCN3_setOPCState(1, true);
   delay(1000);
   if (! (fan_state && laser_state)) {
-    //Serial.println(F("Could not start OPC."));
     while (true) {}
   }
-
-  RPI_TIMESTAMP = millis();
+  
+  analogReference(EXTERNAL);
+  
+  RPI_MODE_TIMESTAMP = millis();
   BATT_TIMESTAMP = millis();
 }
 
 void serviceRPI() {
   unsigned long current_timestamp = millis();
   if (RPI_MODE == 0) {
-    if (current_timestamp >= (RPI_TIMESTAMP + (((unsigned long)RPI_UPDATE_RATE_MINS) * 60000L))) {
+    if (current_timestamp >= (RPI_MODE_TIMESTAMP + (((unsigned long)RPI_UPDATE_RATE_MINS) * 60000L))) {
       RPI_MODE = 1;
       digitalWrite(PIN_RPI_POWER, LOW);
       logTelemetry(F("RPI powering up"));
@@ -158,14 +161,14 @@ void serviceRPI() {
   } else if (RPI_MODE == 2) {
     if (digitalRead(PIN_RPI_RUNNING) == LOW) {
       RPI_MODE = 3;
-      RPI_TIMESTAMP = millis();
+      RPI_MODE_TIMESTAMP = millis();
       logTelemetry(F("RPI powering down"));
     }
   } else if (RPI_MODE == 3) {
-    if (current_timestamp >= (RPI_TIMESTAMP + 60000L)) {
+    if (current_timestamp >= (RPI_MODE_TIMESTAMP + 30000L)) {
       digitalWrite(PIN_RPI_POWER, HIGH);
       RPI_MODE = 0;
-      RPI_TIMESTAMP = millis();
+      RPI_MODE_TIMESTAMP = millis();
       logTelemetry(F("RPI powered down"));
     }
   }
@@ -293,6 +296,7 @@ void loop() {
               log_index ++;                                                                                       // a new logging file (todays date, index incremented).
               COMMAND_MODE = 2;
               SPOOL_COMMAND_MODE = 0;
+              SEND_FILE_CURSOR = 0;
               logTelemetry(F("Data transmission started"));
             }
             if (mode == 3) {
@@ -349,32 +353,14 @@ void loop() {
 uint8_t readADCS(uint8_t adc_mode) {
   unsigned long temp_timestamp;
   if (adc_mode == 0) {
-    startADCReadings(0);
+    startADCReadings();
     ADC_TIMESTAMP = millis();
     adc_mode = 1;
   } else if (adc_mode == 1) {
     temp_timestamp = millis();
     if (temp_timestamp >= (ADC_TIMESTAMP + ADC_INTEGRATION_TIME_MSECS)) {
-      accumulateADCReadings(0);
-      ITERATION_INDEX[0] += 1;
-      adc_mode = 2;
-    } else if (temp_timestamp < ADC_TIMESTAMP) {
-      // millis() must have wrapped-around. Check how long has actually elapsed since the last uc_timestamp by adding-up
-      // how much was left to elapse before millis() wrapped-around, and how much has elapsed since it wrapped-around.
-      unsigned long corrected_uc_timestamp = (4294967296L - ADC_TIMESTAMP) + temp_timestamp;
-      if (corrected_uc_timestamp > ADC_INTEGRATION_TIME_MSECS) {
-        ADC_TIMESTAMP = corrected_uc_timestamp;
-      }
-    }
-  } else if(adc_mode == 2) {
-    startADCReadings(1);
-    ADC_TIMESTAMP = millis();
-    adc_mode = 3;
-  } else if (adc_mode == 3) {
-    temp_timestamp = millis();
-    if (temp_timestamp >= (ADC_TIMESTAMP + ADC_INTEGRATION_TIME_MSECS)) {
-      accumulateADCReadings(1);
-      ITERATION_INDEX[1] += 1;
+      accumulateADCReadings();
+      ITERATION_INDEX += 1;
       adc_mode = 0;
     } else if (temp_timestamp < ADC_TIMESTAMP) {
       // millis() must have wrapped-around. Check how long has actually elapsed since the last uc_timestamp by adding-up
@@ -401,16 +387,11 @@ bool logADCSToSD(DateTime now, int log_index) {
     DATA_FILE.write(string_buffer, 6);
     ultoa(now.unixtime(), string_buffer, 10);
     DATA_FILE.write(string_buffer, 10);
-    for (uint8_t measurement_index = 0; measurement_index < 8; measurement_index ++) {
+    for (uint8_t measurement_index = 0; measurement_index < ADC_COUNT; measurement_index ++) {
       DATA_FILE.write(',');
-      float value = (float)ADC_TOTALS_0[measurement_index] / (float)ITERATION_INDEX[0];
+      float value = (float)ADC_TOTALS[measurement_index] / (float)ITERATION_INDEX;
       dtostrf(value, 0, 3, string_buffer);
       uint8_t val_length = strlen(string_buffer);
-      DATA_FILE.write(string_buffer, val_length);
-      DATA_FILE.write(',');
-      value = (float)ADC_TOTALS_1[measurement_index] / (float)ITERATION_INDEX[1];
-      dtostrf(value, 0, 3, string_buffer);
-      val_length = strlen(string_buffer);
       DATA_FILE.write(string_buffer, val_length);
     }
     DATA_FILE.write("\r\n", 2);
@@ -704,7 +685,7 @@ void setTime() {
         if (COMMAND_STAGE == 5) {                                         // If this is the last time value to get...   (assumes headers are dispatched in order!)
           RTC.adjust(DateTime(TIMESTAMP_BUFFER[0], TIMESTAMP_BUFFER[1], TIMESTAMP_BUFFER[2], TIMESTAMP_BUFFER[3], TIMESTAMP_BUFFER[4], TIMESTAMP_BUFFER[5]));   // Set the time.
           serialSpeak(F("fs"));                                          // Send final ack to RPI.
-          logTelemetry(F("Time update complete"));                       // Log the time update.
+          logTelemetry(F("Time update completed"));                       // Log the time update.
           TIME_COMMAND_MODE = 2;                                            // Switch to time update handshake mode.
         } else if (COMMAND_STAGE < 5) {                                   // If this is not the last time value to get...
           serialSpeak(F("ht"));                                          // Send ack to RPI.
@@ -753,16 +734,16 @@ bool spoolFiles() {
           character = SEND_FILE.read();
           if ((character != '\r') && (character != '\n')) {
             FILENAME_BUFFER[index] = character;                             // Store the filename in a global buffer.
-            if (index > 8) {
-              SEND_FILE_INDEX_BUFFER[index - 9] = character;
-            }
             index ++;
           }
           SEND_FILE_CURSOR ++;
         }
         FILENAME_BUFFER[index] = '\0';                                      // Appends terminating \0 to buffers.
-        SEND_FILE_INDEX_BUFFER[index - 9] = '\0';
-        serialSpeak(SEND_FILE_INDEX_BUFFER);
+        char filename_string[15] = "f}            ";
+        for (int j = 0; j < 15; j ++) {
+          filename_string[j + 2] = FILENAME_BUFFER[j];
+        }
+        serialSpeak(filename_string);
         success = true;
         DATA_FILE_CURSOR = 0;                                               // Zero the data file cursor.
         SPOOL_COMMAND_MODE = 1;                                             // Switch to 'Send file index' mode.
@@ -773,6 +754,7 @@ bool spoolFiles() {
         SPOOL_COMMAND_MODE = 5;                                             // Switch to 'Completion handshake' mode.
       }
       SEND_FILE.close();
+      COMMAND_START_TIMESTAMP = millis();
     } else {
       COMMAND_MODE = 0;                                                       // Couldn't open SEND file, flag this and switch back to base command mode.
       success = false;
@@ -783,18 +765,30 @@ bool spoolFiles() {
     if ((message_to_process == true) && (CRC_SUCCESS == true)) {
       byte message_type = 0;                                                    // Parse message against base commands.
       int mode = parseMessage(message_to_process, message_type);                // 0 = Not recognised, 1 = Set time (ST), 2 = Spool data (TX).
-      if (mode == 2) {                                                          // TX received from RPI, must not have correctly received the file index string.
-        serialSpeak(SEND_FILE_INDEX_BUFFER);                                      // Re-send file index buffer.
+      if (mode == 2) {                                                          // TX received from RPI, must not have correctly received the first filename string.
+        char filename_string[15] = "f}            ";                                // Re-send filename buffer.
+        for (int j = 0; j < 15; j ++) {
+          filename_string[j + 2] = FILENAME_BUFFER[j];
+        }
+        serialSpeak(filename_string);
       } else {
         message_type = 2;                                                       // Parse message against TX commands.
-        int new_mode = parseMessage(message_to_process, message_type);
-        if (new_mode == 1) {                                                    // AK received from RPI, file index string correctly received.
-          SPOOL_COMMAND_MODE = 2;                                                 // Switch to 'load data from current file' mode.
+        int new_mode = parseMessage(message_to_process, message_type);          // 0 = Not recognised, 1 = Acknowledge frame (AK), 2 = Acknowledge resend (AR), 3 = TX completed (CC).
+        if (new_mode == 0) {                                                    // Response from RPI not recognised.
+          serialSpeak(F("cr"));                                                     // Confirm resend.
+        } else if (new_mode == 1) {                                             // AK received from RPI, filename string correctly received.
+          SPOOL_COMMAND_MODE = 2;                                                   // Switch to 'load data from current file' mode.
+        } else if (new_mode == 2) {                                             // AR received from RPI, filename failed CRC check.
+          char filename_string[15] = "f}            ";                                // Re-send filename buffer.
+          for (int j = 0; j < 15; j ++) {
+            filename_string[j + 2] = FILENAME_BUFFER[j];
+          }
+          serialSpeak(filename_string);
         }
       }
       COMMAND_START_TIMESTAMP = millis();
-    } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {        // If message from RPI fails its CRC check, we know the RPI did not receive the file index string
-      serialSpeak(SEND_FILE_INDEX_BUFFER);                                      // as a garbled TX command would have been caught in the main loop. Re-send the file index buffer.
+    } else if ((message_to_process == true) && (CRC_SUCCESS == false)) {        // If message from RPI fails its CRC check, we don't know if the RPI received the filename string
+      serialSpeak(F("cr"));                                                         // Confirm resend.
       COMMAND_START_TIMESTAMP = millis();
     }
   } else if (SPOOL_COMMAND_MODE == 2) {
@@ -821,10 +815,12 @@ bool spoolFiles() {
       COMMAND_MODE = 0;                                                       // Couldn't open DATA file, flag this and switch back to base command mode.
       success = false;
     }
+    COMMAND_START_TIMESTAMP = millis();
   } else if (SPOOL_COMMAND_MODE == 3) {
     // Send the data frame to the RPI.
     serialSpeak(OUTPUT_BUFFER);
     SPOOL_COMMAND_MODE = 4;                                                     // Switch to 'waiting for ack' mode.
+    COMMAND_START_TIMESTAMP = millis();
   } else if (SPOOL_COMMAND_MODE == 4) {
     // Data transmission handshaking with RPI.
     bool message_to_process = serialListen(false);
@@ -885,7 +881,7 @@ bool spoolFiles() {
 bool checkCommandTimeout() {
   bool timeout = false;
   unsigned long current_timestamp = millis();
-  if (current_timestamp > (COMMAND_START_TIMESTAMP + 500L)) {
+  if (current_timestamp > (COMMAND_START_TIMESTAMP + 1000L)) {
     COMMAND_MODE = 0;
     serialSpeak(F("to"));
     logTelemetry(F("Command timeout"));
@@ -893,7 +889,7 @@ bool checkCommandTimeout() {
   } else if (current_timestamp < COMMAND_START_TIMESTAMP) {
     // millis() must have overflowed. Correct for this.
     unsigned long corrected_timestamp = (4294967296L - COMMAND_START_TIMESTAMP) + current_timestamp;
-    if (corrected_timestamp > 500L) {
+    if (corrected_timestamp > 1000L) {
       COMMAND_START_TIMESTAMP = corrected_timestamp;
     }
   }
@@ -924,6 +920,7 @@ bool initialiseChannel(uint8_t channel) {
   // Initialise ADCs.
   for (uint8_t i = 0; i < ADCS_PER_CHANNEL[channel]; i ++) {
     ADCS[i].begin();
+    ADCS[i].setGain(GAIN_ONE);    // Set ADC PGA to +/- 4.096V
   }
   return 0;
 }
@@ -934,31 +931,23 @@ uint8_t i2cSelectChannel(uint8_t channel) {
   return Wire.endTransmission();
 }
 
-void startADCReadings(uint8_t bank) {
+void startADCReadings() {
   for (uint8_t i = 0; i < 4; i ++) {
     i2cSelectChannel(i);
     for (uint8_t j = 0; j < ADCS_PER_CHANNEL[i]; j ++) {
-      if (bank == 0) {
-        ADCS[j].NB_Start_ADC_Differential_0_1();
-      } else if (bank == 1) {
-        ADCS[j].NB_Start_ADC_Differential_2_3();
-      }
+      ADCS[j].NB_Start_ADC_Differential_0_1();
     }
   }
   return 0;
 }
 
-void accumulateADCReadings(uint8_t bank) {
+void accumulateADCReadings() {
   uint8_t adcs_to_this_point = 0;
   for (uint8_t i = 0; i < 4; i ++) {
     i2cSelectChannel(i);
     for (uint8_t j = 0; j < ADCS_PER_CHANNEL[i]; j ++) {
       int16_t new_measurement = ADCS[j].NB_Read_ADC_Differential();
-      if (bank == 0) {
-        ADC_TOTALS_0[adcs_to_this_point] += (int32_t)new_measurement;
-      } else {
-        ADC_TOTALS_1[adcs_to_this_point] += (int32_t)new_measurement;
-      }
+      ADC_TOTALS[adcs_to_this_point] += (int32_t)new_measurement;
       adcs_to_this_point += 1;
     }
   }
@@ -966,12 +955,10 @@ void accumulateADCReadings(uint8_t bank) {
 }
 
 void clearADCAccumulators() {
-  for (uint8_t i = 0; i < 8; i ++) {
-    ADC_TOTALS_0[i] = 0;
-    ADC_TOTALS_1[i] = 0;
+  for (uint8_t i = 0; i < ADC_COUNT; i ++) {
+    ADC_TOTALS[i] = 0;
   }
-  ITERATION_INDEX[0] = 0;
-  ITERATION_INDEX[1] = 0;
+  ITERATION_INDEX = 0;
   return 0;
 }
 
@@ -1245,8 +1232,8 @@ unsigned int MODBUS_CalcCRC(unsigned char data[], unsigned char nbrOfBytes)
 
 void averageBattVolt() {
   unsigned long temp_timestamp = millis();
-  if (temp_timestamp >= (BATT_TIMESTAMP + 1000)) {
-    BATT_TOTAL += (uint32_t)analogRead(A1);
+  if (temp_timestamp >= (BATT_TIMESTAMP + 50L)) {
+    BATT_TOTAL += (uint32_t)analogRead(PIN_BATT_VPLUS);
     BATT_ITERATION_INDEX += 1;
     BATT_TIMESTAMP = millis();
   } else if (temp_timestamp < BATT_TIMESTAMP) {
@@ -1261,7 +1248,7 @@ void averageBattVolt() {
 bool logBattVoltToSD(DateTime now, int log_index) {
   bool success = false;
   float voltage_raw = ((float)BATT_TOTAL) / ((float)BATT_ITERATION_INDEX);
-  float voltage = (5.0 / 1023.0) * voltage_raw * 3.0;
+  float voltage = (4.096 / 1023.0) * voltage_raw * 4.0;
   BATT_ITERATION_INDEX = 0;
   BATT_TOTAL = 0;
   File DATA_FILE;

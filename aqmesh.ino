@@ -154,14 +154,19 @@ void serviceRPI() {
       logTelemetry(F("RPI powering up"));
     }
   } else if (RPI_MODE == 1) {
-    if (digitalRead(PIN_RPI_RUNNING) == HIGH) {
-      RPI_MODE = 2;
-      logTelemetry(F("RPI running"));
+    if (current_timestamp >= (RPI_MODE_TIMESTAMP + (5L * 60000L))) {
+      RPI_MODE = 0;
+      logTelemetry(F("RPI bootup timeout. Abandoning update."));
+      digitalWrite(PIN_RPI_POWER, HIGH);
+    } else {
+      if (digitalRead(PIN_RPI_RUNNING) == HIGH) {
+        RPI_MODE = 2;
+        logTelemetry(F("RPI running"));
+      }
     }
   } else if (RPI_MODE == 2) {
     if (digitalRead(PIN_RPI_RUNNING) == LOW) {
       RPI_MODE = 3;
-      RPI_MODE_TIMESTAMP = millis();
       logTelemetry(F("RPI powering down"));
     }
   } else if (RPI_MODE == 3) {
@@ -1181,7 +1186,7 @@ bool logOPCToSD(DateTime now, int log_index) {
     
     //Compare recalculated Checksum with one sent
     if (*pUInt16 != MODBUS_CalcCRC(SPI_in, 84)) { //if checksums aren't equal
-      DATA_FILE.println(F("<OPC>Checksum error in line above!"));
+      DATA_FILE.println(F("(OPC)Checksum error in line above!"));
     }
     DATA_FILE.close();
     success = true;

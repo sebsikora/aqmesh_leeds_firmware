@@ -74,7 +74,7 @@ unsigned long DATA_FILE_CURSOR = 0;
 bool EOF_FLAG = false;
 
 // RPI control.
-uint8_t RPI_UPDATE_RATE_MINS = 5;
+uint8_t RPI_UPDATE_RATE_MINS = 2;
 unsigned long RPI_MODE_TIMESTAMP = 0;
 byte RPI_MODE = 0;    // 0 = Off, 1 = Booting up, 2 = Running, 3 = Shutting down.
 const int PIN_RPI_RUNNING = 2;
@@ -148,22 +148,24 @@ void setup() {
 void serviceRPI() {
   unsigned long current_timestamp = millis();
   if (RPI_MODE == 0) {
-    if (current_timestamp >= (RPI_MODE_TIMESTAMP + (((unsigned long)RPI_UPDATE_RATE_MINS) * 60000L))) {
+    if (current_timestamp >= (RPI_MODE_TIMESTAMP + (((unsigned long)RPI_UPDATE_RATE_MINS) * 60000UL))) {
       RPI_MODE = 1;
+      RPI_MODE_TIMESTAMP = millis();
       digitalWrite(PIN_RPI_POWER, LOW);
       logTelemetry(F("RPI powering up"));
     }
   } else if (RPI_MODE == 1) {
-    if (current_timestamp >= (RPI_MODE_TIMESTAMP + (5L * 60000L))) {
-      RPI_MODE = 0;
-      logTelemetry(F("RPI bootup timeout. Abandoning update."));
-      digitalWrite(PIN_RPI_POWER, HIGH);
-    } else {
+//    if (current_timestamp >= (RPI_MODE_TIMESTAMP + 300000L)) {
+//      RPI_MODE = 0;
+//      RPI_MODE_TIMESTAMP = millis();
+//      logTelemetry(F("RPI bootup timeout. Abandoning update."));
+//      digitalWrite(PIN_RPI_POWER, HIGH);
+//    } else {
       if (digitalRead(PIN_RPI_RUNNING) == HIGH) {
         RPI_MODE = 2;
         logTelemetry(F("RPI running"));
       }
-    }
+//    }
   } else if (RPI_MODE == 2) {
     if (digitalRead(PIN_RPI_RUNNING) == LOW) {
       RPI_MODE = 3;
@@ -276,7 +278,7 @@ void loop() {
     byte message_type;
     unsigned long temp_timestamp;
     
-    serviceRPI();
+    //serviceRPI();
     
     if (COMMAND_MODE == 0) {      // Idle, waiting for commands...
       message_to_process = serialListen(false);

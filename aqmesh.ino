@@ -79,10 +79,14 @@ unsigned long RPI_MODE_TIMESTAMP = 0;
 byte RPI_MODE = 0;    // 0 = Off, 1 = Booting up, 2 = Running, 3 = Shutting down.
 const int PIN_RPI_RUNNING = 2;
 const int PIN_RPI_POWER = 8;
+const int PIN_RPI_MODE_0 = 6;
+const int PIN_RPI_MODE_1 = 5;
+const int PIN_RPI_MODE_2 = 4;
+const int PIN_RPI_MODE_3 = 3;
 
-// Misc pins
-const int PIN_RTC_FAIL_WARN = 6;
-const int PIN_SD_FAIL_WARN = 7;
+//// Misc pins
+//const int PIN_RTC_FAIL_WARN = 6;
+//const int PIN_SD_FAIL_WARN = 7;
 
 void setup() {
   // Setup pins.
@@ -91,15 +95,24 @@ void setup() {
   
   digitalWrite(PIN_RPI_POWER, HIGH);
   pinMode(PIN_RPI_POWER, OUTPUT);
+
+  digitalWrite(PIN_RPI_MODE_0, HIGH);
+  pinMode(PIN_RPI_MODE_0, OUTPUT);
+  digitalWrite(PIN_RPI_MODE_1, LOW);
+  pinMode(PIN_RPI_MODE_1, OUTPUT);
+  digitalWrite(PIN_RPI_MODE_2, LOW);
+  pinMode(PIN_RPI_MODE_2, OUTPUT);
+  digitalWrite(PIN_RPI_MODE_3, LOW);
+  pinMode(PIN_RPI_MODE_3, OUTPUT);
   
 //  digitalWrite(PIN_OPC_POWER, LOW);
 //  pinMode(PIN_OPC_POWER, OUTPUT);
   
-  digitalWrite(PIN_RTC_FAIL_WARN, LOW);
-  digitalWrite(PIN_SD_FAIL_WARN, LOW);
+  //digitalWrite(PIN_RTC_FAIL_WARN, LOW);
+  //digitalWrite(PIN_SD_FAIL_WARN, LOW);
   
-  pinMode(PIN_RTC_FAIL_WARN, OUTPUT);
-  pinMode(PIN_SD_FAIL_WARN, OUTPUT);
+//  pinMode(PIN_RTC_FAIL_WARN, OUTPUT);
+//  pinMode(PIN_SD_FAIL_WARN, OUTPUT);
   
   digitalWrite(PIN_RPI_RUNNING, LOW);
   pinMode(PIN_RPI_RUNNING, INPUT);
@@ -111,13 +124,13 @@ void setup() {
   
   // Initialise Real Time Clock.
   if (! RTC.begin()) {
-    digitalWrite(PIN_RTC_FAIL_WARN, HIGH);
+    //digitalWrite(PIN_RTC_FAIL_WARN, HIGH);
     while (1);
   }
   
   // INITIALISE SD CARD:
   if (! SD.begin(SD_CS_PIN)) {
-    digitalWrite(PIN_SD_FAIL_WARN, HIGH);
+    //digitalWrite(PIN_SD_FAIL_WARN, HIGH);
     while (true) {}
   }
   
@@ -150,31 +163,32 @@ void serviceRPI() {
   if (RPI_MODE == 0) {
     if (current_timestamp >= (RPI_MODE_TIMESTAMP + (((unsigned long)RPI_UPDATE_RATE_MINS) * 60000UL))) {
       RPI_MODE = 1;
-      RPI_MODE_TIMESTAMP = millis();
       digitalWrite(PIN_RPI_POWER, LOW);
+      digitalWrite(PIN_RPI_MODE_0, LOW);
+      digitalWrite(PIN_RPI_MODE_1, HIGH);
       logTelemetry(F("RPI powering up"));
     }
   } else if (RPI_MODE == 1) {
-//    if (current_timestamp >= (RPI_MODE_TIMESTAMP + 300000L)) {
-//      RPI_MODE = 0;
-//      RPI_MODE_TIMESTAMP = millis();
-//      logTelemetry(F("RPI bootup timeout. Abandoning update."));
-//      digitalWrite(PIN_RPI_POWER, HIGH);
-//    } else {
       if (digitalRead(PIN_RPI_RUNNING) == HIGH) {
         RPI_MODE = 2;
+        digitalWrite(PIN_RPI_MODE_1, LOW);
+        digitalWrite(PIN_RPI_MODE_2, HIGH);
         logTelemetry(F("RPI running"));
       }
-//    }
   } else if (RPI_MODE == 2) {
     if (digitalRead(PIN_RPI_RUNNING) == LOW) {
       RPI_MODE = 3;
+      digitalWrite(PIN_RPI_MODE_2, LOW);
+      digitalWrite(PIN_RPI_MODE_3, HIGH);
       logTelemetry(F("RPI powering down"));
+      RPI_MODE_TIMESTAMP = millis();
     }
   } else if (RPI_MODE == 3) {
     if (current_timestamp >= (RPI_MODE_TIMESTAMP + 30000L)) {
       digitalWrite(PIN_RPI_POWER, HIGH);
       RPI_MODE = 0;
+      digitalWrite(PIN_RPI_MODE_3, LOW);
+      digitalWrite(PIN_RPI_MODE_0, HIGH);
       RPI_MODE_TIMESTAMP = millis();
       logTelemetry(F("RPI powered down"));
     }
@@ -244,6 +258,38 @@ void logTelemetry(const __FlashStringHelper* characters) {
   return 0;
 }
 
+bool logTextToSD(DateTime now, int log_index, const char * characters) {
+  bool success = false;
+  char string_buffer[13];
+  File DATA_FILE;
+  // Generate current logging filename.
+  sprintf(string_buffer, "%04d%02d%02d.%03d", now.year(), now.month(), now.day(), log_index);
+  DATA_FILE = SD.open(string_buffer, O_CREAT | O_WRITE | O_APPEND);
+  int n = 0;
+  for (const char * i = characters; *i != '\0'; i ++) {
+    n += 1;
+  }
+  if (DATA_FILE) {
+    success = true;
+    DATA_FILE.write(characters, n);
+    DATA_FILE.write("\r\n", 2);
+    DATA_FILE.close();
+  }
+  return success;
+}
+
+void logTextToSD(DateTime now, int log_index, const __FlashStringHelper* characters) {
+  int len = 0;
+  for (const char PROGMEM *ptr = (const char PROGMEM *)characters; pgm_read_byte(ptr) != '\0'; ptr ++) {
+    len ++;
+  }
+  char string_buffer[len + 1];
+  memcpy_P(string_buffer, characters, len);
+  string_buffer[len] = '\0';
+  logTextToSD(now, log_index, string_buffer);
+  return 0;
+}
+
 bool logFileToSend(const char * characters) {
   bool success = false;
   File SEND_FILE;
@@ -263,11 +309,11 @@ bool logFileToSend(const char * characters) {
 
 void loop() {
   DateTime now = RTC.now();
-  DateTime last_time = now;
+  DateTime last_log = now;
   int32_t adc_last_time = now.unixtime();
   int32_t opc_last_time = now.unixtime();
   int32_t batt_last_time = now.unixtime();
-  uint8_t file_change_last_day = now.day();
+  //uint8_t file_change_last_day = now.day();
   int log_index = getLogIndex();
   char filename[13];
   uint8_t adc_mode = 0;
@@ -278,7 +324,7 @@ void loop() {
     byte message_type;
     unsigned long temp_timestamp;
     
-    //serviceRPI();
+    serviceRPI();
     
     if (COMMAND_MODE == 0) {      // Idle, waiting for commands...
       message_to_process = serialListen(false);
@@ -297,14 +343,14 @@ void loop() {
               logTelemetry(F("Time update started"));
             }
             if (mode == 2) {
-              now = RTC.now();
-              sprintf(filename, "%04d%02d%02d.%03d", now.year(), now.month(), now.day(), log_index);              // These lines add the current file to the 'to-send' list
-              logFileToSend(filename);                                                                            // Then increase the index so the next data log will create
-              log_index ++;                                                                                       // a new logging file (todays date, index incremented).
-              COMMAND_MODE = 2;
-              SPOOL_COMMAND_MODE = 0;
-              SEND_FILE_CURSOR = 0;
-              logTelemetry(F("Data transmission started"));
+              sprintf(filename, "%04d%02d%02d.%03d", last_log.year(), last_log.month(), last_log.day(), log_index);   // These lines add the current file to the 'to-send' list
+              logFileToSend(filename);                                                                                // Then increase the index so the next data log will create
+              log_index ++;                                                                                           // a new logging file (todays date, index incremented).
+              logTextToSD(last_log, log_index, F("(BLANK_HEADER)"));                            // We immediately create a blank header to ensure that the file
+              COMMAND_MODE = 2;                                                                 // is actually created, in case the date changes between the increment of the log index
+              SPOOL_COMMAND_MODE = 0;                                                           // and the next time data is written to the SD card. If we don't do this, when the date
+              SEND_FILE_CURSOR = 0;                                                             // changes prior to the next SD card write, the current dat file name will be added to the
+              logTelemetry(F("Data transmission started"));                                     // SEND file list, even though it does not yet exist. This will cause problems next update.
             }
             if (mode == 3) {
               serialSpeak(F("ak"));
@@ -331,26 +377,28 @@ void loop() {
     
     now = RTC.now();
     if ((now.unixtime() >= (adc_last_time + (int32_t)ADC_UPDATE_RATE_SECS)) || (now.unixtime() >= (opc_last_time + (int32_t)OPC_UPDATE_RATE_SECS)) || (now.unixtime() >= (batt_last_time + (int32_t)BATT_UPDATE_RATE_SECS))) {
-      if (now.day() != file_change_last_day) {        // If the day has changed since we last wrote measurements to the SD card, we've rolled-over Midnight, or changed the date,
-                                                      // so we start a new extension index and add the last filename to the 'to send' file.
-       sprintf(filename, "%04d%02d%02d.%03d", last_time.year(), last_time.month(), last_time.day(), log_index);
+      if (now.day() != last_log.day()) {             // If the day has changed since we last wrote measurements to the SD card, we've rolled-over Midnight, or changed the date,
+                                                     // so we start a new extension index and add the last filename to the 'to send' file.
+       sprintf(filename, "%04d%02d%02d.%03d", last_log.year(), last_log.month(), last_log.day(), log_index);
        logFileToSend(filename);
        log_index = 0;
-       file_change_last_day = (uint8_t)now.day();
       }
+      
+      last_log = now;
+      
       if (now.unixtime() >= (adc_last_time + (int32_t)ADC_UPDATE_RATE_SECS)) {
-        logADCSToSD(now, log_index);
+        logADCSToSD(last_log, log_index);
         clearADCAccumulators();
-        adc_last_time = now.unixtime();
+        adc_last_time = last_log.unixtime();
       }
       if (now.unixtime() >= (opc_last_time + (int32_t)OPC_UPDATE_RATE_SECS)) {
         bool success = OPCN3_readHistogram();
-        success = logOPCToSD(now, log_index);
-        opc_last_time = now.unixtime();
+        success = logOPCToSD(last_log, log_index);
+        opc_last_time = last_log.unixtime();
       }
       if (now.unixtime() >= (batt_last_time + (int32_t)BATT_UPDATE_RATE_SECS)) {
-        bool success = logBattVoltToSD(now, log_index);
-        batt_last_time = now.unixtime();
+        bool success = logBattVoltToSD(last_log, log_index);
+        batt_last_time = last_log.unixtime();
       }
     }
   }
